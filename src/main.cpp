@@ -31,10 +31,12 @@ unsigned long g_critical_heap_since_ms = 0;
 void printRuntimeDiagnostics() {
   const wl_status_t wifi_status = WiFi.status();
   const int rssi = wifi_status == WL_CONNECTED ? WiFi.RSSI() : 0;
-  Serial.printf("diag: uptime=%lus heap=%u min_heap=%u largest=%u wifi=%d rssi=%d radar=%d\n",
+  Serial.printf("diag: uptime=%lus heap=%u min_heap=%u largest=%u largest_internal=%u wifi=%d rssi=%d radar=%d\n",
                 millis() / 1000UL, static_cast<unsigned>(ESP.getFreeHeap()),
                 static_cast<unsigned>(ESP.getMinFreeHeap()),
                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(
+                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
                 static_cast<int>(wifi_status), rssi, g_radar_visible ? 1 : 0);
 }
 

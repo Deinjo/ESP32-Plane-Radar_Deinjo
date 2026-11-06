@@ -8,6 +8,7 @@
 
 #include <cctype>
 #include <cfloat>
+#include <cstdlib>
 #include <cstring>
 
 #include "config.h"
@@ -23,7 +24,7 @@ constexpr float kMetresPerFoot = 0.3048f;
 constexpr int kConnectAttemptMs = 3000;
 constexpr unsigned long kAdsbRequestTimeoutMs = 5000;
 constexpr unsigned long kAdsbFailureBackoffMs = 30000;
-constexpr unsigned long kAdsbMaxFailureBackoffMs = 300000;
+constexpr unsigned long kAdsbMaxFailureBackoffMs = 60000;
 constexpr size_t kEnrichmentCacheSize = 48;
 
 Aircraft s_aircraft[kMaxAircraft];
@@ -37,6 +38,148 @@ bool s_enrichment_paused = false;
 unsigned long s_enrichment_recovery_started_ms = 0;
 double s_last_center_lat = 0.0;
 double s_last_center_lon = 0.0;
+
+class ChunkedTransferStream final : public Stream {
+ public:
+  explicit ChunkedTransferStream(WiFiClient& client) : client_(client) {}
+
+  int available() override {
+    if (!advanceChunk()) {
+      return 0;
+    }
+    const int available_bytes = client_.available();
+    if (available_bytes <= 0) {
+      return 0;
+    }
+    return static_cast<size_t>(available_bytes) < chunk_remaining_
+               ? available_bytes
+               : static_cast<int>(chunk_remaining_);
+  }
+
+  int read() override {
+    if (!advanceChunk()) {
+      return -1;
+    }
+    const int value = client_.read();
+    if (value >= 0) {
+      --chunk_remaining_;
+      if (chunk_remaining_ == 0U) {
+        needs_chunk_terminator_ = true;
+      }
+    }
+    return value;
+  }
+
+  int peek() override {
+    return advanceChunk() ? client_.peek() : -1;
+  }
+
+  void flush() override {}
+  size_t write(uint8_t) override { return 0U; }
+  size_t write(const uint8_t*, size_t) override { return 0U; }
+
+  void drain() {
+    while (!done_ && !failed_) {
+      if (!advanceChunk()) {
+        break;
+      }
+      while (chunk_remaining_ > 0U) {
+        if (read() < 0) {
+          failed_ = true;
+          break;
+        }
+      }
+    }
+  }
+
+ private:
+  bool readLine(char* line, size_t line_size, size_t* length) {
+    if (line == nullptr || line_size < 2U || length == nullptr) {
+      return false;
+    }
+    size_t written = 0U;
+    while (true) {
+      const int value = client_.read();
+      if (value < 0) {
+        return false;
+      }
+      if (value == '\n') {
+        break;
+      }
+      if (written + 1U >= line_size) {
+        return false;
+      }
+      line[written] = static_cast<char>(value);
+      ++written;
+    }
+    if (written > 0U && line[written - 1U] == '\r') {
+      --written;
+    }
+    line[written] = '\0';
+    *length = written;
+    return true;
+  }
+
+  bool advanceChunk() {
+    if (done_ || failed_) {
+      return false;
+    }
+    if (chunk_remaining_ > 0U) {
+      return true;
+    }
+
+    if (needs_chunk_terminator_) {
+      const int carriage_return = client_.read();
+      const int line_feed = client_.read();
+      if (carriage_return != '\r' || line_feed != '\n') {
+        failed_ = true;
+        return false;
+      }
+      needs_chunk_terminator_ = false;
+    }
+
+    char line[64] = {};
+    size_t line_length = 0U;
+    if (!readLine(line, sizeof(line), &line_length)) {
+      failed_ = true;
+      return false;
+    }
+    char* extension = std::strchr(line, ';');
+    if (extension != nullptr) {
+      *extension = '\0';
+    }
+    char* end = nullptr;
+    const unsigned long chunk_size = std::strtoul(line, &end, 16);
+    if (end == line || *end != '\0' || chunk_size > 65536UL) {
+      failed_ = true;
+      return false;
+    }
+
+    if (chunk_size == 0UL) {
+      for (size_t trailer_count = 0U; trailer_count < 16U; ++trailer_count) {
+        if (!readLine(line, sizeof(line), &line_length)) {
+          failed_ = true;
+          return false;
+        }
+        if (line_length == 0U) {
+          done_ = true;
+          return false;
+        }
+      }
+      failed_ = true;
+      return false;
+    }
+
+    chunk_remaining_ = static_cast<size_t>(chunk_size);
+    return true;
+  }
+
+  WiFiClient& client_;
+  size_t chunk_remaining_ = 0U;
+  bool needs_chunk_terminator_ = false;
+  bool done_ = false;
+  bool failed_ = false;
+};
 
 struct EnrichmentCacheEntry {
   char hex[7] = {};
@@ -82,6 +225,26 @@ void printNetworkDiagnostics() {
 
 size_t largestFreeBlock() {
   return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+}
+
+size_t largestInternalFreeBlock() {
+  return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
+bool pauseEnrichmentAfterTlsAllocationFailure(WiFiClientSecure& client,
+                                               const char* service) {
+  char error[96] = {};
+  if (client.lastError(error, sizeof(error)) != MBEDTLS_ERR_SSL_ALLOC_FAILED) {
+    return false;
+  }
+
+  s_enrichment_paused = true;
+  s_enrichment_recovery_started_ms = 0;
+  Serial.printf("flight data: paused after %s TLS allocation failure: %s "
+                "heap=%u largest_internal=%u\n",
+                service, error, static_cast<unsigned>(ESP.getFreeHeap()),
+                static_cast<unsigned>(largestInternalFreeBlock()));
+  return true;
 }
 
 unsigned long adsbFailureBackoff() {
@@ -467,6 +630,7 @@ bool fetchFlightDataJson(const String& url, const char* callsign,
                   code, callsign, millis() - started_ms,
                   static_cast<unsigned>(ESP.getFreeHeap()),
                   static_cast<unsigned>(ESP.getMinFreeHeap()));
+    pauseEnrichmentAfterTlsAllocationFailure(client, "route");
     printNetworkDiagnostics();
     return false;
   }
@@ -562,6 +726,18 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
                   static_cast<unsigned>(s_adsb_failure_count));
     return false;
   };
+  // Reuse one TLS client and HTTP session. Repeatedly creating and destroying
+  // TLS contexts fragments the ESP32-C3 internal heap over long runtimes.
+  static WiFiClientSecure client;
+  static HTTPClient http;
+  if (!client.connected()) {
+    // A peer may have closed keep-alive between polls. Ensure stale TLS state
+    // is released before opening a fresh session on the next request.
+    client.stop();
+  } else {
+    Serial.println("adsb: reusing HTTPS connection");
+  }
+
   const unsigned long started_ms = millis();
   printRequestDiagnostics("request-start", started_ms);
 
@@ -576,28 +752,50 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   url += "/dist/";
   url += String(dist_nm, 1);
 
-  WiFiClientSecure client;
   client.setInsecure();
 
-  HTTPClient http;
   if (!http.begin(client, url)) {
     Serial.println("adsb: http.begin failed");
+    client.stop();
     return requestFailed();
   }
 
-  // Prefer a Content-Length response so truncated HTTPS bodies can be
-  // detected before they reach ArduinoJson.
-  http.useHTTP10(true);
+  static bool response_headers_collected = false;
+  if (!response_headers_collected) {
+    static const char* response_headers[] = {"Transfer-Encoding"};
+    http.collectHeaders(response_headers, 1U);
+    response_headers_collected = true;
+  }
+
+  http.setReuse(true);
+  http.useHTTP10(false);
   http.setTimeout(kAdsbRequestTimeoutMs);
   const int code = performGet(http);
+  const int response_size = http.getSize();
+  String transfer_encoding = http.header("Transfer-Encoding");
+  transfer_encoding.toLowerCase();
+  const bool chunked_response = transfer_encoding.indexOf("chunked") >= 0;
+  static bool response_framing_logged = false;
+  if (!response_framing_logged) {
+    response_framing_logged = true;
+    Serial.printf("adsb: response framing size=%d transfer=%s\n", response_size,
+                  transfer_encoding.length() > 0 ? transfer_encoding.c_str()
+                                                 : "none");
+  }
   printRequestDiagnostics("after-get", started_ms);
   if (code != HTTP_CODE_OK) {
-    Serial.printf("adsb: HTTP %d t=%lums heap=%u min_heap=%u\n", code,
+    Serial.printf("adsb: HTTP %d t=%lums heap=%u min_heap=%u largest=%u largest_internal=%u\n", code,
                   millis() - started_ms,
                   static_cast<unsigned>(ESP.getFreeHeap()),
-                  static_cast<unsigned>(ESP.getMinFreeHeap()));
+                  static_cast<unsigned>(ESP.getMinFreeHeap()),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(
+                      MALLOC_CAP_8BIT)),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(
+                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+    pauseEnrichmentAfterTlsAllocationFailure(client, "ADS-B");
     printNetworkDiagnostics();
     http.end();
+    client.stop();
     return requestFailed();
   }
 
@@ -605,6 +803,7 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   if (stream == nullptr) {
     Serial.println("adsb: response stream unavailable");
     http.end();
+    client.stop();
     return requestFailed();
   }
 
@@ -626,8 +825,15 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   aircraft_filter["gs"] = true;
   aircraft_filter["tas"] = true;
   aircraft_filter["ias"] = true;
-  const DeserializationError err =
-      deserializeJson(doc, *stream, DeserializationOption::Filter(filter));
+  DeserializationError err;
+  if (chunked_response) {
+    ChunkedTransferStream decoded_stream(*stream);
+    err = deserializeJson(doc, decoded_stream,
+                          DeserializationOption::Filter(filter));
+    decoded_stream.drain();
+  } else {
+    err = deserializeJson(doc, *stream, DeserializationOption::Filter(filter));
+  }
   printRequestDiagnostics("after-json", started_ms);
   http.end();
   if (err) {
@@ -635,13 +841,24 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
                   err.c_str(), millis() - started_ms,
                   static_cast<unsigned>(ESP.getFreeHeap()),
                   static_cast<unsigned>(ESP.getMinFreeHeap()));
+    client.stop();
     return requestFailed();
+  }
+
+  if (!client.connected()) {
+    client.stop();
   }
 
   JsonArray ac = doc["ac"].as<JsonArray>();
   if (ac.isNull()) {
     s_aircraft_count = 0;
     s_last_adsb_failure_ms = 0;
+    s_adsb_failure_count = 0;
+    Serial.printf("adsb: valid JSON response has no ac array, size=%d "
+                  "transfer=%s\n",
+                  response_size,
+                  transfer_encoding.length() > 0 ? transfer_encoding.c_str()
+                                                 : "none");
     return true;
   }
 
@@ -741,9 +958,11 @@ bool enrichOnePending() {
 bool enrichmentAllowed() {
   const uint32_t free_heap = ESP.getFreeHeap();
   const size_t largest_block = largestFreeBlock();
+  const size_t largest_internal_block = largestInternalFreeBlock();
   const bool pause_critical =
       free_heap < config::kEnrichmentPauseFreeHeap ||
-      largest_block < config::kEnrichmentPauseLargestBlock;
+      largest_block < config::kEnrichmentPauseLargestBlock ||
+      largest_internal_block < config::kEnrichmentPauseLargestBlock;
 
   if (pause_critical) {
     if (!s_enrichment_paused) {
@@ -762,7 +981,8 @@ bool enrichmentAllowed() {
 
   const bool recovered =
       free_heap >= config::kEnrichmentResumeFreeHeap &&
-      largest_block >= config::kEnrichmentResumeLargestBlock;
+      largest_block >= config::kEnrichmentResumeLargestBlock &&
+      largest_internal_block >= config::kEnrichmentResumeLargestBlock;
   if (!recovered) {
     s_enrichment_recovery_started_ms = 0;
     return false;

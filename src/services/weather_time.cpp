@@ -170,6 +170,13 @@ void setPollFn(PollFn fn) { s_poll_fn = fn; }
 
 bool refreshIfDue(double latitude, double longitude, bool force) {
   begin();
+  // The weather request opens a separate TLS connection. On the ESP32-C3,
+  // skip it when neither the footer (weather/clock) nor night mode needs the
+  // API's weather and timezone data.
+  if (!settings::footerEnabled() && !settings::nightModeEnabled()) {
+    return false;
+  }
+
   const unsigned long now = millis();
   const bool location_changed =
       fabs(latitude - s_last_latitude) > 0.0001 ||

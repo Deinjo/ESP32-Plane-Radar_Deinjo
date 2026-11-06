@@ -82,17 +82,18 @@ constexpr bool kAdsbShowGroundAircraft = false;
 
 // --- Flight enrichment (origin/destination and detailed aircraft type) ---
 constexpr char kFlightDataApiBase[] = "https://api.adsbdb.com/v0/";
-/** One lookup at a time; successful results remain cached for six hours. */
-constexpr unsigned long kFlightLookupMinIntervalMs = 5000UL;
+/** Optional TLS lookups stay well below the core ADS-B polling frequency. */
+constexpr unsigned long kFlightLookupMinIntervalMs = 30000UL;
 constexpr unsigned long kFlightLookupTimeoutMs = 3000UL;
-constexpr unsigned long kFlightLookupFailureBackoffMs = 30000UL;
+/** Avoid repeated TLS allocation attempts while the system is memory-constrained. */
+constexpr unsigned long kFlightLookupFailureBackoffMs = 300000UL;
 constexpr unsigned long kFlightCacheSuccessMs = 6UL * 60UL * 60UL * 1000UL;
 constexpr unsigned long kFlightCacheMissMs = 10UL * 60UL * 1000UL;
-/** Runtime protection: optional enrichment is paused before the system is critical. */
+/** Keep optional route TLS disabled unless the core ADS-B path has ample reserve. */
 constexpr uint32_t kEnrichmentPauseFreeHeap = 24000UL;
 constexpr uint32_t kEnrichmentResumeFreeHeap = 40000UL;
-constexpr size_t kEnrichmentPauseLargestBlock = 12000UL;
-constexpr size_t kEnrichmentResumeLargestBlock = 20000UL;
+constexpr size_t kEnrichmentPauseLargestBlock = 48000UL;
+constexpr size_t kEnrichmentResumeLargestBlock = 56000UL;
 constexpr unsigned long kEnrichmentResumeStableMs = 15000UL;
 constexpr uint32_t kCriticalFreeHeap = 8000UL;
 constexpr size_t kCriticalLargestBlock = 4000UL;

@@ -66,6 +66,9 @@ bool s_last_frame_complete = false;
 bool s_last_frame_used_sprite = false;
 bool s_night_mode_known = false;
 bool s_last_night_mode = false;
+// Keep the full-screen frame buffer in static DRAM instead of allocating it
+// from the live Wi-Fi/TLS heap after the network stack has started.
+uint16_t s_frame_buffer[radar::kSize * radar::kSize] = {};
 
 class DrawScope {
  public:
@@ -1158,7 +1161,8 @@ bool ensureFrameSprite() {
     return true;
   }
   s_frame.setColorDepth(16);
-  if (!s_frame.createSprite(radar::kSize, radar::kSize)) {
+  s_frame.setBuffer(s_frame_buffer, radar::kSize, radar::kSize, 16);
+  if (s_frame.getBuffer() == nullptr) {
     Serial.println("radar: frame sprite alloc failed");
     return false;
   }
