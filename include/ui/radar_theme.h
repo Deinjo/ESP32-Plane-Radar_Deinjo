@@ -52,10 +52,8 @@ constexpr int kRunwayLabelHeightPx = kCardinalLabelHeightPx;
 constexpr int kRunwayLabelGapPx = 3;
 /** Gap from triangle edge to tag block (px). */
 constexpr int kAircraftLabelGapPx = 1;
-/** Keep symbol centroid inside outer ring by at least this inset (px). */
-constexpr int kAircraftInsideRingInsetPx =
-    kAircraftNoseLenPx + kAircraftTailHalfPx + 1;
-
+/** Retain the existing city/airport admission margin; not used for aircraft. */
+constexpr int kMapLabelInsideRingInsetPx = 13;
 /** Beyond-ring traffic: bearing cues on screen rim (correct direction, fixed radius). */
 constexpr int kBeyondRingDotRadiusPx = 4;
 constexpr int kBeyondRingScreenMarginPx = 2;

@@ -12,6 +12,8 @@ Firmware for an **ESP32-C3 Super Mini** with a **1.28-inch round GC9A01 display*
 - Live nearby aircraft from [adsb.fi](https://opendata.adsb.fi/)
 - Circular radar display with configurable 5, 10, 15, and 25 km range presets
 - Aircraft heading triangles, speed vectors, altitude, callsign, route, and compact aircraft type labels
+- Continuous display-only aircraft motion between ADS-B responses, with labels attached directly behind the heading triangles
+- Persistent route/callsign preference and a live ADS-B table below the WebDisplay
 - Direction markers for aircraft outside the display range but inside the ADS-B query radius
 - Airport and runway overlay using embedded OurAirports data
 - ICAO or IATA airport labels and airport selection by ICAO/IATA code
@@ -93,7 +95,17 @@ The main page provides links for:
 - Exit
 - Display preview
 
-The `Display` page shows a browser preview of the current round display and refreshes the BMP image periodically.
+The `Display` page shows the current round display and a live ADS-B table below
+it. Callsign, route, type, hex ID, altitude, speed, track, distance and position
+age come from the already received aircraft list, not a separate external
+request or the animated positions. Retained aircraft outside the outer ring
+are included (at most 64 rows); missing values appear as a dash.
+
+The page requests `/aircraft.json` and `/display.bmp` sequentially, then waits
+five seconds before the next cycle. Hidden tabs stop starting new requests and
+resume on return. A failed refresh retains the last table/image and displays a
+warning; position samples older than 15 seconds are marked stale. Mobile users
+can scroll the table horizontally. This is periodic imagery, not live video.
 
 ### Common Setup
 
@@ -104,6 +116,7 @@ The `Display` page shows a browser preview of the current round display and refr
 - Reset location to the configured default
 - Kilometer or mile distance labels
 - IATA or ICAO airport labels
+- Show route instead of callsign when available (enabled by default)
 - Runway overlay enable/disable
 - Radar range
 - Footer and weather visibility
@@ -115,6 +128,25 @@ The `Display` page shows a browser preview of the current round display and refr
 - OTA password
 
 Common settings are stored persistently in NVS.
+With the route checkbox enabled, an available route replaces the callsign;
+without a route, callsign remains the fallback. Disable it to always show the
+callsign. This affects aircraft labels, not the table's separate callsign/route
+columns. Devices without the new NVS key retain the previous route preference.
+
+Portal pages are sent in bounded 512-byte pieces instead of assembling
+page-sized strings in the ESP32's fragmented Wi-Fi/TLS heap. The home, Wi-Fi
+and information renderers reuse native WiFiManager fragments; Wi-Fi scanning,
+credential saving and connecting still use WiFiManager. Shared portal CSS and
+navigation JavaScript are cached separately with a build-specific URL. Setup
+HTML is never cached. Streamed HTML/asset writes have a bounded timeout and
+yield to network processing; the ADS-B TLS connection and watchdog remain unchanged.
+
+Both setup forms reject incomplete submissions with HTTP 400 before writing
+settings. Reload the page if that happens; a cached form from older firmware
+also needs to be reloaded. Unchecked checkboxes are valid and are not required
+in the request. The OTA password field stays blank: leave it blank to retain
+the stored password. These completeness checks are not authentication or CSRF
+protection; keep the configuration portal on a trusted network.
 
 ### Component Setup
 
@@ -145,6 +177,32 @@ Configured components include:
 
 The footer's overall visibility remains available in Common Setup. Background and footer background are color-only because they are not independently hideable components in the display model.
 
+### Portal Regression Checks
+
+Host checks for bounded HTML output, escaping, disconnect handling and form
+completeness (no device required):
+
+```powershell
+python scripts/test_radar_motion.py --test portal_html --compiler <path-to-g++-clang++-or-zig>
+```
+
+For a bounded live-browser check (Python Playwright required):
+
+```powershell
+python scripts/check_setup_pages.py --url http://<device-ip> --channel msedge --passes 3 --check-rejections
+```
+
+Omit `--channel msedge` when using Playwright's bundled Chromium. The check
+loads the portal pages, verifies both forms and mobile layout, exercises
+browser-only controls, and checks OTA authentication. With `--check-rejections`
+it sends deliberately incomplete requests only, then compares settings. It
+never submits a valid Save, changes Wi-Fi credentials, resets the location,
+restarts the device, or uploads firmware. Screenshots mask coordinates and the
+password field; the JSON report contains no setting values. Evidence goes to
+temporary storage by default, including a partial report on test failure.
+Saving valid settings, first-time AP setup and Wi-Fi reconnection are separate
+acceptance checks, not covered by this non-destructive regression.
+
 ## BOOT Button
 
 The BOOT button is connected to GPIO 9 and is active LOW.
@@ -173,12 +231,95 @@ The selected range and distance unit survive reboot.
 - Aircraft inside the outer ring are rendered as red heading triangles.
 - A magenta speed vector shows the projected movement direction.
 - Aircraft outside the ring but inside the ADS-B query radius are shown as bearing markers on the display rim.
-- Callsigns are shown while route enrichment is unavailable.
-- Routes are displayed as origin-destination pairs such as `FRA-DUS` when available.
+- Callsigns are shown when route preference is disabled or route enrichment is unavailable.
+- With route preference enabled, routes are displayed as origin-destination pairs such as `FRA-DUS` when available.
 - Aircraft types are compacted for the display, for example `Boeing 737-800` becomes `B737-800`.
 - Ground aircraft are hidden by default.
 
-Origin and destination are not part of the basic ADS-B position response. Active callsigns are optionally enriched through [ADSBDB](https://www.adsbdb.com/). Successful results are cached for six hours and misses for ten minutes. Enrichment is rate-limited and uses an increasing retry backoff after TLS or network failures so it cannot block the main radar function continuously.
+Origin and destination are not part of the basic ADS-B position response. Active callsigns are optionally enriched through [ADSBDB](https://www.adsbdb.com/). Routes are cached for six hours; missing routes for ten minutes even if a type was found. Network/TLS failures impose a five-minute lookup backoff.
+
+To fit the ESP32-C3's RAM without reducing display quality, route/type lookups
+release the retained position-feed TLS session first. Two 17,408-byte TLS record
+slots are permanently reserved and reused through mbedTLS's allocator hook;
+smaller allocations keep the SDK allocator. This prevents the two large record
+buffers from depending on a fragmented web/scan heap. Admission requires both
+slots idle, at least 48,000 free heap bytes and a 12,000-byte allocatable internal
+block for the remaining handshake/crypto/JSON/TCP work. Only
+one optional HTTP request starts per 30-second slot; a callsign fallback waits
+for a later slot. Filtered JSON retains only route codes and aircraft type.
+Position polling rebuilds its connection afterward and keeps it between slots.
+Optional lookups are skipped when position data is stale or acquisition is
+failing. Custom colors, font and NVS settings are unchanged.
+
+The RGB565 framebuffer is packed by row for the round panel, with an extra
+eight-pixel radial margin for preview/cardinal text. All physical-panel pixels
+retain full 16-bit color and alpha blending; only invisible outer square corners
+are omitted from storage (the BMP shows background there). This saves 15,104 B
+including layout overhead, without RGB332 color reduction or an extra framebuffer.
+The reserved TLS slots increase reported static RAM: that memory was previously
+allocated dynamically by each TLS session, so static-RAM percentage alone is not
+a useful comparison of total runtime headroom.
+
+This is a memory-sharing tradeoff: periodic TLS reconnects can briefly pause
+animation and increase a position-poll gap. Enrichment remains best-effort;
+private/general-aviation callsigns often have no published route. The route
+checkbox prefers available data; it does not guarantee a route for every aircraft.
+
+Bounded hardware validation (2026-11-07) includes a five-minute combined
+setup/scan/WebDisplay stress run with 96 successful position responses, six
+route requests and zero recorded errors or record-pool spills. The normal
+firmware also retrieved routes for real received aircraft (DXB-DUS and PRN-DTM).
+These checks do not replace extended endurance, Wi-Fi-outage recovery or
+physical-panel acceptance; detailed evidence and remaining cases are tracked
+in `PROJECT_MEMORY.md`.
+
+### Motion and Label Continuity
+
+- The panel targets a frame every 125 ms (about 8 FPS) without increasing ADS-B request frequency. Aircraft symbols, vectors, bearing markers, and labels share the same display position.
+- Positions advance using valid ground speed and ground track. Prediction is limited to ten seconds including `seen_pos` and time since the actual response was accepted; zooming does not restart this limit. Missing/invalid ground motion produces no velocity extrapolation.
+- Small position corrections are blended over one second. Corrections larger than 24 pixels snap to the new observation rather than drawing an invented flight across the radar.
+- Labels stay directly behind the triangle with a small tail gap. Attachment follows its smoothed heading during turns; the text itself remains horizontal and centered. There is no alternative placement, collision avoidance/forecast, leader line or inward clamping.
+- Labels, triangles and vectors are clipped just inside the outer radar ring. During entry/exit, the intersecting portion remains visible, including trailing text after the aircraft center has left the circle. They are not admitted or removed as a whole at the center crossing.
+- Only enabled, non-empty fields occupy rows: disabling aircraft type places altitude directly below callsign/route. Symbols and vectors are drawn above label text.
+
+Continuity deliberately takes priority over eliminating every overlap. Traffic can move into overlapping label positions; these overlaps are accepted instead of making text wander around the display. Synchronous HTTPS requests and WebDisplay BMP transfers can pause animation; this is not a real-time renderer or a navigation instrument. The WebDisplay's periodic images are not an 8-FPS video stream. Final visual acceptance belongs on the physical panel.
+
+### Display Regression Checks
+
+Host tests compile the same motion/trailing-label and circular-clipping helpers used by the firmware, without an Arduino SDK or connected device. Additional suites cover bounded JSON snapshots and route preference persistence using the real settings module with fake NVS:
+
+```powershell
+python scripts/test_radar_motion.py --compiler <path-to-g++-clang++-or-zig>
+python scripts/test_radar_motion.py --test aircraft_snapshot --compiler <path-to-g++-clang++-or-zig>
+python scripts/test_radar_motion.py --test display_settings --compiler <path-to-g++-clang++-or-zig>
+python scripts/test_radar_motion.py --test reusable_http_session --compiler <path-to-g++-clang++-or-zig>
+python scripts/test_radar_motion.py --test flight_data_json --compiler <path-to-g++-clang++-or-zig>
+python scripts/test_radar_motion.py --test round_frame_layout --compiler <path-to-g++-clang++-or-zig>
+python scripts/test_radar_motion.py --test tls_record_pool --compiler <path-to-g++-clang++-or-zig>
+```
+
+The `flight_data_json` suite uses the actual ArduinoJson headers installed by
+`pio run -e supermini`; it tests the production filter/parser without a device.
+
+For live table/image cycles and clearly separated browser-only edge cases:
+
+```powershell
+python scripts/check_live_display.py --url http://<device-ip> --channel msedge
+```
+
+This read-only Playwright/Pillow check verifies sequential requests, simulated
+background pause/resume, and synthetic empty/stale/64-row/error/mobile cases.
+It never saves settings; host fake-NVS results do not replace target persistence
+acceptance. JSON reports contain no raw aircraft/settings values; screenshots
+of the live display may contain the currently visible traffic and map labels.
+
+For a bounded sequence of actual WebDisplay images (Playwright and Pillow required):
+
+```powershell
+python scripts/capture_radar_animation.py --url http://<device-ip>/display --frames 4 --interval 1 --channel msedge
+```
+
+Omit `--channel msedge` when Playwright's bundled Chromium is installed. The inspection browser disables automatic BMP polling and closes after the requested frames. PNGs, a contact sheet, a GIF, and timing metadata go to temporary storage by default. The recorded intervals include transfer time; screenshots verify appearance, not panel FPS. Avoid continuous BMP polling during serial-only endurance tests.
 
 ### Airports and Runways
 
@@ -223,12 +364,37 @@ The firmware uses several safeguards for the limited ESP32-C3 heap:
 - ADS-B and weather responses are parsed directly from HTTP streams instead of retaining complete response strings.
 - ADS-B JSON is filtered to the fields required by the display.
 - Optional ADSBDB flight enrichment is rate-limited and cached.
-- Repeated ADS-B TLS failures use an increasing backoff up to several minutes.
-- Optional flight enrichment can be paused when the current heap or largest free block becomes low. It resumes automatically after a stable recovery period.
+- ADS-B failures back off for 30 seconds initially, then at most 60 seconds.
+- Healthy ADS-B HTTPS sessions are reused. After a peer disconnect or request/parse failure, both HTTP and TLS objects are discarded and recreated for the next permitted attempt; the TLS handshake has a five-second timeout. A transport failure does not trigger a reboot loop.
+- Optional flight enrichment checks its record slots and remaining heap reserve after releasing position TLS, never while a second live position/route TLS session is retained. An insufficient slot is skipped until the next rate-limited attempt; network failures retain the five-minute backoff.
+- TLS record storage is reusable, aligned, zero-initialized and wiped on release. `tls pool: free=... hits=... spills=...` diagnostics distinguish reserved-slot use from large allocations falling back to the normal allocator. The hook is installed once before Wi-Fi startup, not changed around active sessions. Active weather/night-mode combinations still require dedicated testing.
+- The record-pool sizing is validated against the pinned ESP32 SDK. After an SDK/platform upgrade, recheck actual record allocations and hit/spill diagnostics; do not assume the same capacities or memory reserves remain sufficient.
 - A 15-second task watchdog detects a genuine main-loop stall after the initial Wi-Fi/setup phase.
 - A controlled restart is only considered when the current free heap or largest free block remains critically low for several seconds.
 
 The historical `min_heap` value is diagnostic only. It does not trigger a reset by itself.
+
+### Apparent freeze with old aircraft data
+
+If `/aircraft.json` still responds but its `revision` no longer increases and
+`sample_age_ms` keeps growing, the webserver/main loop may be healthy while
+ADS-B acquisition is failing. Positions intentionally stop extrapolating after
+ten seconds; that can look like a frozen panel. A task watchdog cannot detect
+this logical loss of fresh data while the loop continues to run.
+
+Capture diagnostics before restarting. `adsb: HTTP -1` means connection setup
+failed, not that an HTTP server returned a status. New logs distinguish fresh
+and reused sessions and include the transport error, revision and sample age.
+These diagnostics cannot by themselves distinguish every network/provider
+outage from a client fault. For serial inspection, set DTR and RTS false BEFORE
+opening the port to avoid resetting the device under investigation.
+
+The session-owner host regression is supplemental lifecycle evidence, not a
+TLS/network or endurance test:
+
+```powershell
+python scripts/test_radar_motion.py --test reusable_http_session --compiler <path-to-g++-clang++-or-zig>
+```
 
 Typical serial diagnostics look like:
 

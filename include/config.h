@@ -89,12 +89,12 @@ constexpr unsigned long kFlightLookupTimeoutMs = 3000UL;
 constexpr unsigned long kFlightLookupFailureBackoffMs = 300000UL;
 constexpr unsigned long kFlightCacheSuccessMs = 6UL * 60UL * 60UL * 1000UL;
 constexpr unsigned long kFlightCacheMissMs = 10UL * 60UL * 1000UL;
-/** Keep optional route TLS disabled unless the core ADS-B path has ample reserve. */
-constexpr uint32_t kEnrichmentPauseFreeHeap = 24000UL;
-constexpr uint32_t kEnrichmentResumeFreeHeap = 40000UL;
-constexpr size_t kEnrichmentPauseLargestBlock = 48000UL;
-constexpr size_t kEnrichmentResumeLargestBlock = 56000UL;
-constexpr unsigned long kEnrichmentResumeStableMs = 15000UL;
+/** Admission AFTER releasing position TLS; never permit overlapping sessions.
+ * Two 17 KB record slots are reserved separately and must be idle. The heap
+ * reserve below is for handshake/crypto/JSON/TCP, not those pinned records.
+ */
+constexpr uint32_t kEnrichmentSlotFreeHeap = 48000UL;
+constexpr size_t kEnrichmentSlotLargestBlock = 12000UL;
 constexpr uint32_t kCriticalFreeHeap = 8000UL;
 constexpr size_t kCriticalLargestBlock = 4000UL;
 constexpr unsigned long kCriticalHeapDurationMs = 5000UL;

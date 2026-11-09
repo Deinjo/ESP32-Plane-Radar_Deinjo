@@ -13,6 +13,7 @@
 #include "services/display_settings.h"
 #include "services/ota_update.h"
 #include "services/radar_location.h"
+#include "services/tls_record_pool.h"
 #include "services/weather_time.h"
 #include "services/wifi_setup.h"
 #include "ui/radar_display.h"
@@ -29,6 +30,7 @@ unsigned long g_last_diagnostic_ms = 0;
 unsigned long g_critical_heap_since_ms = 0;
 
 void printRuntimeDiagnostics() {
+  services::net::printTlsRecordPoolDiagnostics();
   const wl_status_t wifi_status = WiFi.status();
   const int rssi = wifi_status == WL_CONNECTED ? WiFi.RSSI() : 0;
   Serial.printf("diag: uptime=%lus heap=%u min_heap=%u largest=%u largest_internal=%u wifi=%d rssi=%d radar=%d\n",
@@ -139,6 +141,7 @@ void setup() {
   delay(500);
   Serial.println();
   Serial.println("Plane Radar");
+  services::net::initTlsRecordPool();
 
   bootButtonInit();
   displayInit();
@@ -168,13 +171,12 @@ void loop() {
     g_last_diagnostic_ms = millis();
     printRuntimeDiagnostics();
   }
-  if (g_radar_visible) {
-    ui::radarDisplayTick();
-  }
-
   if (services::ota::inProgress()) {
     delay(10);
     return;
+  }
+  if (g_radar_visible) {
+    ui::radarDisplayTick();
   }
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -206,8 +208,10 @@ void loop() {
     } else if (services::weather::refreshIfDue(
                    services::location::lat(), services::location::lon())) {
       ui::radarDisplayRefreshAircraft();
-    } else if (services::adsb::enrichmentAllowed() &&
+    } else if (millis() - g_last_adsb_fetch_ms < config::kAdsbFetchIntervalMs &&
                services::adsb::enrichOnePending()) {
+      // Recheck after weather I/O: even a failed refresh may have used the
+      // remaining poll interval. Do not chain another TLS request in that case.
       ui::radarDisplayRefreshAircraft();
     }
   }

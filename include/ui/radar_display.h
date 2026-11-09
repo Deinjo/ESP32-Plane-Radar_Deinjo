@@ -10,7 +10,7 @@ void radarDisplayDraw();
 /** Redraw aircraft only (blits cached grid; no full-screen clear). */
 void radarDisplayRefreshAircraft();
 
-/** Update the display when the configured night-mode boundary is crossed. */
+/** Animate the radar between ADS-B polls and handle night-mode changes. */
 void radarDisplayTick();
 
 /** Stream the current 240x240 display frame as a 24-bit BMP image. */

@@ -4,11 +4,16 @@
 #include <WiFiManager.h>
 
 #include <ArduinoJson.h>
+#include <algorithm>
+#include <cerrno>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 
 #include <Preferences.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
+#include <lwip/sockets.h>
 
 #ifdef WM_MDNS
 #include <ESPmDNS.h>
@@ -19,10 +24,14 @@
 #include "hardware/display.h"
 #include "services/display_settings.h"
 #include "services/ota_update.h"
+#include "services/adsb_client.h"
+#include "services/aircraft_snapshot.h"
+#include "services/portal_html.h"
 #include "services/radar_location.h"
 #include "ui/radar_range.h"
 #include "ui/radar_display.h"
 #include "ui/status_screens.h"
+#include "web/display_page.h"
 
 portMUX_TYPE s_boot_mux = portMUX_INITIALIZER_UNLOCKED;
 volatile bool s_boot_tap_pending = false;
@@ -60,8 +69,12 @@ void initBootButton() {
 
 namespace {
 
-constexpr char kPortalGlobalStyle[] =
-    "<style>"
+// Keep WiFiManager's page-sized Strings small. Shared assets are served from
+// flash in bounded writes, not copied into every native portal page.
+constexpr char kPortalHead[] =
+    "<link rel='stylesheet' href='/portal.css?v=" __DATE__ "-" __TIME__ "'>"
+    "<script defer src='/portal.js?v=" __DATE__ "-" __TIME__ "'></script>";
+constexpr char kPortalCss[] PROGMEM =
     "*{box-sizing:border-box}"
     "body{margin:0;padding:24px;background:#0d151e;color:#d7e0e9;"
     "font-family:Segoe UI,Arial,sans-serif;font-size:15px;line-height:1.45}"
@@ -81,12 +94,15 @@ constexpr char kPortalGlobalStyle[] =
     "h3{font-size:1rem;margin:1.5rem 0 .7rem!important;padding:10px 12px;"
     "background:#1a2937;border-left:3px solid #62899d;border-radius:6px}"
     "label{color:#b8c6d3}"
-    "input[type=text],input[type=password],input[type=number],select{"
+    "input:not([type]),input[type=text],input[type=password],input[type=number],input[type=time],select{"
     "width:100%;padding:9px 10px;background:#0f1923;color:#e4edf4;"
     "border:1px solid #35495b;border-radius:6px;outline:none}"
     "input[type=color]{width:52px;height:32px;padding:3px;background:#0f1923;"
     "border:1px solid #526577;border-radius:5px}"
     "input[type=range]{accent-color:#7098aa}input[type=checkbox]{accent-color:#7098aa}"
+    ".common-setup input{width:100%;margin:5px 0;font:inherit}"
+    ".common-setup input[type=checkbox]{width:auto}"
+    "dt{font-weight:600}dd{margin:0 0 .6rem;overflow-wrap:anywhere}"
     "button,input[type=submit]{padding:8px 13px;background:#38596b;color:#eef5f8;"
     "border:1px solid #5e8191;border-radius:6px;font:inherit;cursor:pointer}"
     "button:hover,input[type=submit]:hover{background:#486f80;border-color:#83a8b7}"
@@ -101,9 +117,9 @@ constexpr char kPortalGlobalStyle[] =
     "font-size:1.05rem;font-weight:600}"
      ".portal-menu-link:hover{background:#486f80;border-color:#83a8b7}"
      ".portal-divider{border:0;border-top:2px solid #71808a;margin:24px 0 16px}"
-     "@media(max-width:520px){body{padding:12px}form{padding:16px}}"
-     "</style>"
-    "<script>document.addEventListener('DOMContentLoaded',function(){"
+      "@media(max-width:520px){body{padding:12px}form{padding:16px}}";
+constexpr char kPortalJs[] PROGMEM =
+     "document.addEventListener('DOMContentLoaded',function(){"
     "var w=document.querySelector('.wrap');if(!w)return;"
      "if(location.pathname==='/' ){"
      "var r=document.createElement('div');r.className='c';"
@@ -120,14 +136,32 @@ constexpr char kPortalGlobalStyle[] =
      "cr.className='c';cr.appendChild(c);var ch=document.createElement('hr');"
      "ch.className='portal-divider';var s=w.querySelector('.msg');"
      "if(s){w.insertBefore(ch,s);w.insertBefore(cr,s);}else{w.appendChild(ch);w.appendChild(cr);}}"
-     "});</script>";
+      "});";
 
 /** Separate from planeradar prefs (rangeInit) to avoid NVS handle conflicts. */
 constexpr char kWifiPrefsNamespace[] = "wifi";
 constexpr char kPrefsForcePortalKey[] = "portal";
 
 bool s_force_config_portal = false;
-WiFiManager s_wm;
+// Reuse native fragments, not the library's unbounded whole-page builders.
+// Keep this adapter local; Wi-Fi scan/save/connect remain native.
+class PortalWiFiManager : public WiFiManager {
+ public:
+  String infoItem(const char* name) { return getInfoData(name); }
+  String menuItems() { return getMenuOut(); }
+  String statusItem() { String item; reportStatus(item); return item; }
+  String scanItems(bool refresh) { WiFi_scanNetworks(refresh, false); return getScanItemOut(); }
+  String staticFields() { return getStaticOut(); }
+  bool redirectCaptivePortal() { return captivePortal(); }
+  String wifiFields() {
+    String fields = FPSTR(HTTP_FORM_WIFI);
+    fields.replace(FPSTR(T_v), htmlEntities(WiFi_SSID()));
+    fields.replace(FPSTR(T_p), WiFi_psk().length() != 0 ? S_passph : "");
+    return fields;
+  }
+  void notePortalRequest() { handleRequest(); }
+};
+PortalWiFiManager s_wm;
 bool s_wm_configured = false;
 
 void ensureWifiManager();
@@ -136,44 +170,8 @@ void stopLanWebPortal();
 bool wifiLinkUp();
 void attachSettingsRoutes();
 
-void handleDisplayPage() {
-  if (!s_wm.server) {
-    return;
-  }
-  s_wm.server->send(200, "text/html",
-                    "<!doctype html><html><head><meta name='viewport' "
-                    "content='width=device-width,initial-scale=1'>"
-                    "<title>Plane Radar Display</title><style>"
-                    "body{margin:0;padding:20px;background:#0d151e;color:#d7e0e9;"
-                    "font-family:Segoe UI,Arial,sans-serif;text-align:center}"
-                    "main{max-width:520px;margin:auto;background:#141f2a;"
-                    "padding:20px;border:1px solid #2a3a49;border-radius:12px}"
-                    "img{width:min(100%,480px);height:auto;image-rendering:auto;"
-                    "border:1px solid #526577;border-radius:8px}"
-                    "a{display:inline-block;margin-top:16px;padding:8px 13px;"
-                    "background:#38596b;color:#eef5f8;border:1px solid #5e8191;"
-                    "border-radius:6px;text-decoration:none}</style></head><body>"
-                    "<main><h2>Plane Radar Display</h2>"
-                    "<img id='display' src='/display.bmp'>"
-                    "<script>setInterval(function(){document.getElementById('display').src="
-                    "'/display.bmp?t='+Date.now()},5000);</script>"
-                    "<br><a href='/'>Home</a></main></body></html>");
-}
-
-void handleDisplayBmp() {
-  if (!s_wm.server) {
-    return;
-  }
-  if (!ui::radarDisplayFrameReady()) {
-    s_wm.server->send(503, "text/plain", "Display frame not ready");
-    return;
-  }
-  constexpr size_t kBmpSize = 54 + 240 * 240 * 3;
-  s_wm.server->setContentLength(kBmpSize);
-  s_wm.server->send(200, "image/bmp", "");
-  WiFiClient client = s_wm.server->client();
-  ui::radarDisplayWriteBmp(client);
-}
+void handleDisplayPage();
+void handleDisplayBmp();
 
 const data::large_airports::Airport* findAirportByCode(const String& code) {
   for (size_t i = 0; i < data::large_airports::kAirportCount; ++i) {
@@ -268,39 +266,308 @@ String componentColor(uint32_t color) {
   return String(value);
 }
 
-void appendComponentRow(String& page, const char* id, const char* label,
+// Bounded plain-HTTP output without page-sized Strings or tiny chunk-framing
+// allocations. TLS clients and native WiFiManager save handlers are untouched.
+struct PortalChunkSink {
+  WebServer& web;
+  unsigned long transfer_started;
+  bool preserve_heap;
+  explicit PortalChunkSink(WebServer& server, bool reserve_heap = false)
+      : web(server), transfer_started(millis()), preserve_heap(reserve_heap) {}
+
+  bool writeAll(const char* bytes, size_t length) {
+    WiFiClient client = web.client();
+    const int socket = client.fd();
+    const unsigned long started = millis();
+    while (length != 0 && socket >= 0 && client.connected()) {
+      if (millis() - transfer_started >= 8000UL) break;
+      // WiFiClient::write can retry for many seconds under heap/TCP pressure.
+      // Bound this plain-HTTP socket only; do not touch the ADS-B TLS client.
+      // Large previews must let queued TCP/Wi-Fi buffers drain before they
+      // consume the RAM needed by the still-live ADS-B TLS connection.
+      const bool wait_for_heap = preserve_heap &&
+          (ESP.getFreeHeap() < 16000U || ESP.getMaxAllocHeap() < 4096U);
+      const int written = wait_for_heap ? 0 : ::send(socket, bytes, length, MSG_DONTWAIT);
+      if (written > 0) {
+        bytes += written;
+        length -= static_cast<size_t>(written);
+      } else if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        break;
+      }
+      if (length == 0) {
+        return true;
+      }
+      if (millis() - started >= 2000UL) {
+        break;
+      }
+      delay(1);
+    }
+    // Abort rather than emitting a corrupt/truncated form with a success tail.
+    if (socket >= 0) {
+      ::shutdown(socket, SHUT_RDWR);
+    }
+    Serial.println("Setup: response aborted after disconnect or write timeout");
+    return false;
+  }
+
+  bool operator()(const char* bytes, size_t length) {
+    const bool sent = writeAll(bytes, length);
+    delay(5);
+    return sent;
+  }
+};
+using PortalHtml = services::portal::HtmlWriter<PortalChunkSink>;
+
+void servePortalAsset(const char* content_type, const char* bytes, size_t length) {
+  if (!s_wm.server) {
+    return;
+  }
+  WebServer& web = *s_wm.server;
+  web.client().setNoDelay(true);
+  web.sendHeader("Cache-Control", "public, max-age=86400, immutable");
+  web.setContentLength(length);
+  web.send(200, content_type, "");
+  PortalChunkSink sink{web};
+  while (length != 0) {
+    const size_t count = length > 512 ? 512 : length;
+    if (!sink(bytes, count)) {
+      break;
+    }
+    bytes += count;
+    length -= count;
+  }
+}
+
+void startPortalPage(WebServer& web, const char* content_type = "text/html; charset=utf-8") {
+  s_wm.notePortalRequest();
+  Serial.printf("portal: stream %s heap=%u\n", web.uri().c_str(),
+                static_cast<unsigned>(ESP.getFreeHeap()));
+  web.client().setNoDelay(true);
+  // Close-delimited HTTP/1.0 is valid for HTTP/1.0 and HTTP/1.1 clients and
+  // avoids WebServer's heap-allocated HTTP chunk headers. handleClient() closes
+  // its connection as soon as this handler returns; do not set _chunked state.
+  char header[192];
+  snprintf(header, sizeof(header),
+      "HTTP/1.0 200 OK\r\nContent-Type: %s\r\n"
+      "Cache-Control: no-store\r\nConnection: close\r\n\r\n", content_type);
+  PortalChunkSink sink{web};
+  sink.writeAll(header, strlen(header));
+}
+
+void finishPortalPage(PortalHtml& html) {
+  html.flush();
+}
+
+void handleDisplayPage() {
+  if (!s_wm.server) return;
+  WebServer& web = *s_wm.server;
+  startPortalPage(web);
+  PortalChunkSink sink{web};
+  PortalHtml page(sink);
+  page.append(web::display::kPage);
+  finishPortalPage(page);
+}
+
+void handleAircraftSnapshot() {
+  if (!s_wm.server) return;
+  WebServer& web = *s_wm.server;
+  startPortalPage(web, "application/json");
+  PortalChunkSink sink{web};
+  PortalHtml json(sink);
+  services::adsb::writeAircraftSnapshot(json, services::adsb::aircraftList(),
+      services::adsb::aircraftCount(), services::adsb::aircraftRevision(),
+      services::adsb::aircraftReceivedMs(), millis(), services::location::lat(),
+      services::location::lon(), ui::radar::useMiles());
+  finishPortalPage(json);
+}
+
+class PortalBmpOutput : public Print {
+ public:
+  explicit PortalBmpOutput(WebServer& web) : sink_{web, true} {}
+  size_t write(uint8_t byte) override { return write(&byte, 1); }
+  size_t write(const uint8_t* bytes, size_t length) override {
+    size_t sent = 0;
+    while (sent < length) {
+      const size_t count = std::min<size_t>(1440, length - sent);
+      if (!sink_.writeAll(reinterpret_cast<const char*>(bytes + sent), count)) break;
+      sent += count;
+      delay(1);
+    }
+    return sent;
+  }
+ private:
+  PortalChunkSink sink_;
+};
+
+void handleDisplayBmp() {
+  if (!s_wm.server) return;
+  if (!ui::radarDisplayFrameReady()) {
+    s_wm.server->send(503, "text/plain", "Display frame not ready");
+    return;
+  }
+  constexpr size_t kBmpSize = 54 + 240 * 240 * 3;
+  const unsigned long started = millis();
+  Serial.println("portal: BMP begin");
+  // Let TCP coalesce the 720-byte rows instead of allocating one tiny packet
+  // per writer fragment. This applies only to the preview's plain HTTP socket.
+  s_wm.server->client().setNoDelay(false);
+  s_wm.server->sendHeader("Connection", "close");
+  s_wm.server->setContentLength(kBmpSize);
+  s_wm.server->send(200, "image/bmp", "");
+  PortalBmpOutput output(*s_wm.server);
+  ui::radarDisplayWriteBmp(output);
+  Serial.printf("portal: BMP end t=%lums\n", millis() - started);
+}
+
+void appendNativePortalHead(PortalHtml& page, const char* title) {
+  page.append("<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+      "<meta name='viewport' content='width=device-width,initial-scale=1'><title>");
+  page.escaped(title);
+  page.append("</title>");
+  page.append(HTTP_SCRIPT);
+  page.append(HTTP_STYLE);
+  page.append(kPortalHead);
+  page.append("</head><body><div class='wrap'>");
+}
+
+void handleHomePage() {
+  if (!s_wm.server || s_wm.redirectCaptivePortal()) {
+    return;
+  }
+  WebServer& web = *s_wm.server;
+  startPortalPage(web);
+  PortalChunkSink sink{web};
+  PortalHtml page(sink);
+  appendNativePortalHead(page, "Plane Radar");
+  page.append("<h1>Plane Radar</h1><h3>");
+  page.escaped(s_wm.getDefaultAPName().c_str());
+  page.append(" - ");
+  page.escaped((s_wm.getConfigPortalActive() ? WiFi.softAPIP() : WiFi.localIP()).toString().c_str());
+  page.append("</h3>");
+  page.append(s_wm.menuItems().c_str());
+  page.append(s_wm.statusItem().c_str());
+  page.append("</div></body></html>");
+  finishPortalPage(page);
+}
+
+void handleWifiPage(bool scan) {
+  if (!s_wm.server) {
+    return;
+  }
+  WebServer& web = *s_wm.server;
+  // The first native scan can take longer than the bounded HTTP transfer.
+  // Complete it before starting the response deadline, not between chunks.
+  String scan_items;
+  if (scan) {
+    scan_items = s_wm.scanItems(web.hasArg("refresh"));
+  }
+  startPortalPage(web);
+  PortalChunkSink sink{web};
+  PortalHtml page(sink);
+  appendNativePortalHead(page, "Configure WiFi");
+  if (scan) {
+    // The native scan list is the only variable-sized fragment; no large page
+    // String coexists with it. Saving credentials still uses /wifisave unchanged.
+    page.append(scan_items.c_str());
+    scan_items = String();
+  }
+  page.append("<form method='POST' action='/wifisave'>");
+  page.append(s_wm.wifiFields().c_str());
+  page.append(s_wm.staticFields().c_str());
+  page.append(HTTP_FORM_WIFI_END);
+  page.append(HTTP_FORM_END);
+  page.append(HTTP_SCAN_LINK);
+  page.append(s_wm.statusItem().c_str());
+  page.append("</div></body></html>");
+  finishPortalPage(page);
+}
+
+void rejectIncompleteForm(WebServer& web) {
+  web.send(400, "text/plain",
+           "Incomplete setup form. Nothing saved. Reload the setup page.");
+  Serial.println("Setup: rejected incomplete form; settings unchanged");
+}
+
+void handleInfoPage() {
+  if (!s_wm.server) {
+    return;
+  }
+  WebServer& web = *s_wm.server;
+  startPortalPage(web);
+  PortalChunkSink sink{web};
+  PortalHtml page(sink);
+  page.append("<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>Device information</title>");
+  page.append(kPortalHead);
+  page.append("</head><body><div class='wrap'><h1>Device information</h1>");
+  const char* items[] = {"esphead", "uptime", "chipid", "chiprev", "idesize",
+      "flashsize", "cpufreq", "freeheap", "memsketch", "memsmeter", "temp",
+      "wifihead", "conx", "stassid", "staip", "stagw", "stasub", "dnss",
+      "host", "stamac"};
+  for (const char* name : items) {
+    page.append(s_wm.infoItem(name).c_str());
+  }
+  // The C3 has one core. Native WiFiManager's lastreset item assumes two.
+  char reset_reason[12];
+  snprintf(reset_reason, sizeof(reset_reason), "%d", static_cast<int>(esp_reset_reason()));
+  page.append("<dt>Last reset reason (ESP-IDF)</dt><dd>");
+  page.escaped(reset_reason);
+  page.append("</dd>");
+  // LAN mode has no AP netif; querying its hostname produces a framework error.
+  if ((WiFi.getMode() & WIFI_AP) != 0) {
+    page.append("<h3>WiFi access point</h3>");
+    const char* ap_items[] = {"apip", "apmac", "aphost", "apbssid"};
+    for (const char* name : ap_items) {
+      page.append(s_wm.infoItem(name).c_str());
+    }
+  }
+  page.append("</dl><h3>About</h3><dl>");
+  const char* about[] = {"aboutver", "aboutarduinover", "aboutsdkver", "aboutdate"};
+  for (const char* name : about) {
+    page.append(s_wm.infoItem(name).c_str());
+  }
+  page.append("</dl><p><a href='/firmware'>Firmware update</a></p>"
+      "<form action='/erase' method='get'><button class='D'>Erase WiFi config</button></form>"
+      "</div></body></html>");
+  finishPortalPage(page);
+}
+
+void appendComponentRow(PortalHtml& page, const char* id, const char* label,
                         services::settings::ColorId color_id,
                         services::settings::VisibilityId visibility_id,
                         bool include_visibility,
                         const char* default_color) {
-  page += "<section class='component'><div class='component-title'>";
-  page += label;
-  page += "</div><div class='component-controls'><input id='";
-  page += id;
-  page += "' name='";
-  page += id;
-  page += "' type='color' value='";
-  page += componentColor(services::settings::color(color_id));
-  page += "' data-default='";
-  page += default_color;
-  page += "'><button type='button' data-reset='";
-  page += id;
-  page += "'>Back to default</button>";
+  page.append("<section class='component'><div class='component-title'>");
+  page.escaped(label);
+  page.append("</div><div class='component-controls'><input id='");
+  page.escaped(id);
+  page.append("' name='");
+  page.escaped(id);
+  page.append("' type='color' value='");
+  page.escaped(componentColor(services::settings::color(color_id)).c_str());
+  page.append("' data-default='");
+  page.escaped(default_color);
+  page.append("'><button type='button' data-reset='");
+  page.escaped(id);
+  page.append("'>Back to default</button>");
   if (include_visibility) {
-    page += "<label><input type='checkbox' name='";
-    page += id;
-    page += "_visible' value='T'";
-    if (services::settings::visible(visibility_id)) page += " checked";
-    page += "> On</label>";
+    page.append("<label><input type='checkbox' name='");
+    page.escaped(id);
+    page.append("_visible' value='T'");
+    if (services::settings::visible(visibility_id)) page.append(" checked");
+    page.append("> On</label>");
   }
-  page += "</div></section>";
+  page.append("</div></section>");
 }
 
 void handleComponentPage() {
   if (!s_wm.server) return;
-  String page;
-  page.reserve(7500);
-  page = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+  WebServer& web = *s_wm.server;
+  startPortalPage(web);
+  PortalChunkSink sink{web};
+  PortalHtml page(sink);
+  page.append("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
          "<title>ComponentSetup</title><style>"
          "*{box-sizing:border-box}body{margin:0;padding:24px;background:#0d151e;color:#d7e0e9;"
          "font:15px Segoe UI,Arial,sans-serif}main{max-width:760px;margin:auto;background:#141f2a;"
@@ -313,7 +580,7 @@ void handleComponentPage() {
          "@media(max-width:520px){body{padding:12px}main{padding:16px}}"
           "</style></head><body><main><a href='/param'>CommonSetup</a> | "
           "<a href='/'>Home</a><h1>ComponentSetup</h1>"
-         "<form method='POST' action='/component-save'>";
+          "<form method='POST' action='/component-save'>");
   appendComponentRow(page, "color_bg", "Background", services::settings::ColorId::kBackground,
                      services::settings::VisibilityId::kGrid, false, "#040a1c");
   appendComponentRow(page, "color_grid", "Grid", services::settings::ColorId::kGrid,
@@ -342,16 +609,24 @@ void handleComponentPage() {
                      services::settings::VisibilityId::kCity, true, "#aaaaaa");
   appendComponentRow(page, "color_footer", "Footer background", services::settings::ColorId::kFooterBackground,
                      services::settings::VisibilityId::kGrid, false, "#031020");
-  page += "<p><input type='submit' value='Save'></p></form><script>"
+  page.append("<input type='hidden' name='_form_complete' value='component-v1'>"
+          "<p><input type='submit' value='Save'></p></form><script>"
           "document.querySelectorAll('[data-reset]').forEach(function(b){b.onclick=function(){"
           "document.getElementById(b.dataset.reset).value=document.getElementById(b.dataset.reset).dataset.default;};});"
-          "</script></main></body></html>";
-  s_wm.server->send(200, "text/html", page);
+          "</script></main></body></html>");
+  finishPortalPage(page);
 }
 
 void handleComponentSave() {
   if (!s_wm.server) return;
   WebServer& web = *s_wm.server;
+  const String marker = web.arg(services::portal::kFormCompleteField);
+  if (!services::portal::completeComponentForm(marker.c_str(), [&web](const char* name) {
+        return web.hasArg(name) && web.arg(name).length() != 0;
+      })) {
+    rejectIncompleteForm(web);
+    return;
+  }
   const String color_background = web.arg("color_bg");
   const String color_grid = web.arg("color_grid");
   const String color_label = web.arg("color_label");
@@ -431,6 +706,10 @@ char s_iata_checkbox_attrs[32] = "type=\"checkbox\"";
 WiFiManagerParameter s_param_use_iata(
     "use_iata", "Show IATA airport codes", "T", 2,
     s_iata_checkbox_attrs, WFM_LABEL_AFTER);
+char s_route_checkbox_attrs[32] = "type=\"checkbox\"";
+WiFiManagerParameter s_param_prefer_route(
+    "prefer_route", "Show route instead of callsign when available", "T", 2,
+    s_route_checkbox_attrs, WFM_LABEL_AFTER);
 
 char s_runways_checkbox_attrs[32] = "type=\"checkbox\"";
 WiFiManagerParameter s_param_runways("show_runways", "Show airport runways", "T", 2,
@@ -528,6 +807,9 @@ void refreshPortalParamDefaults() {
   refreshCheckboxAttrs(s_iata_checkbox_attrs, sizeof(s_iata_checkbox_attrs),
                        services::settings::useIataCodes());
   s_param_use_iata.setValue("T", 2);
+  refreshCheckboxAttrs(s_route_checkbox_attrs, sizeof(s_route_checkbox_attrs),
+                        services::settings::preferRoute());
+  s_param_prefer_route.setValue("T", 2);
   refreshCheckboxAttrs(s_runways_checkbox_attrs,
                        sizeof(s_runways_checkbox_attrs),
                        ui::radar::showRunways());
@@ -577,6 +859,78 @@ void refreshPortalParamDefaults() {
 
 }
 
+void appendPortalParameter(PortalHtml& page, const WiFiManagerParameter& parameter) {
+  const char* id = parameter.getID();
+  if (id == nullptr) {
+    // Custom blocks and attributes are trusted firmware constants, not input.
+    page.append(parameter.getCustomHTML());
+    return;
+  }
+  const auto label = [&page, &parameter, id]() {
+    page.append("<label for='");
+    page.escaped(id);
+    page.append("'>");
+    page.escaped(parameter.getLabel());
+    page.append("</label>");
+  };
+  if (parameter.getLabelPlacement() == WFM_LABEL_BEFORE) {
+    label();
+  }
+  page.append("<br><input id='");
+  page.escaped(id);
+  page.append("' name='");
+  page.escaped(id);
+  char length[12];
+  snprintf(length, sizeof(length), "%d", parameter.getValueLength());
+  page.append("' maxlength='");
+  page.escaped(length);
+  page.append("' value='");
+  page.escaped(parameter.getValue());
+  page.append("' ");
+  page.append(parameter.getCustomHTML());
+  page.append(">\n");
+  if (parameter.getLabelPlacement() == WFM_LABEL_AFTER) {
+    label();
+  }
+}
+
+void handleCommonSetupPage() {
+  if (!s_wm.server) {
+    return;
+  }
+  WebServer& web = *s_wm.server;
+  refreshPortalParamDefaults();
+  WiFiManagerParameter** parameters = s_wm.getParameters();
+  const int count = s_wm.getParametersCount();
+  if (parameters == nullptr || count == 0) {
+    web.send(503, "text/plain", "Setup parameters unavailable. Nothing saved.");
+    return;
+  }
+  for (int i = 0; i < count; ++i) {
+    if (parameters[i] == nullptr) {
+      web.send(503, "text/plain", "Setup parameters unavailable. Nothing saved.");
+      return;
+    }
+  }
+
+  startPortalPage(web);
+  PortalChunkSink sink{web};
+  PortalHtml page(sink);
+  page.append("<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>Common Setup</title>");
+  page.append(kPortalHead);
+  page.append("</head><body class='common-setup'><div class='wrap'><h1>Common Setup</h1>"
+      "<form method='POST' action='/paramsave'>");
+  for (int i = 0; i < count; ++i) {
+    appendPortalParameter(page, *parameters[i]);
+  }
+  // Last control: a browser cannot submit a normally truncated form as valid.
+  page.append("<input type='hidden' name='_form_complete' value='common-v2'>"
+      "<br><br><button type='submit'>Save</button></form></div></body></html>");
+  finishPortalPage(page);
+}
+
 void onPortalParamsSaved() {
   if (!services::location::saveFromStrings(s_param_lat.getValue(),
                                            s_param_lon.getValue())) {
@@ -594,7 +948,7 @@ void onPortalParamsSaved() {
     s_param_ota_password.getValue(),
     s_param_night_enabled.getValue(),
     s_param_night_start.getValue(), s_param_night_end.getValue(),
-    s_param_use_iata.getValue());
+    s_param_use_iata.getValue(), s_param_prefer_route.getValue());
 }
 
 void savePortalParamsFromRequest(WebServer& web) {
@@ -614,6 +968,7 @@ void savePortalParamsFromRequest(WebServer& web) {
   const String night_start = web.arg("night_start");
   const String night_end = web.arg("night_end");
   const String use_iata = web.arg("use_iata");
+  const String prefer_route = web.arg("prefer_route");
   if (!services::location::saveFromStrings(latitude.c_str(),
                                            longitude.c_str())) {
     Serial.println("Invalid lat/lon in portal — keeping previous location");
@@ -626,7 +981,7 @@ void savePortalParamsFromRequest(WebServer& web) {
     altitude_metres.c_str(), clock24.c_str(),
     text_scale.c_str(), ota_password.c_str(),
     night_enabled.c_str(), night_start.c_str(), night_end.c_str(),
-    use_iata.c_str());
+    use_iata.c_str(), prefer_route.c_str());
   refreshPortalParamDefaults();
 }
 
@@ -636,6 +991,20 @@ void handleSettingsSaved() {
   }
 
   WebServer& web = *s_wm.server;
+  if (web.method() != HTTP_POST) {
+    web.sendHeader("Allow", "POST");
+    web.send(405, "text/plain", "Use POST to save settings.");
+    return;
+  }
+  const String marker = web.arg(services::portal::kFormCompleteField);
+  if (!services::portal::completeCommonForm(marker.c_str(), [&web](const char* name) {
+        // A blank OTA password is valid and means keep the stored secret.
+        return web.hasArg(name) &&
+            (strcmp(name, "ota_password") == 0 || web.arg(name).length() != 0);
+      })) {
+    rejectIncompleteForm(web);
+    return;
+  }
   savePortalParamsFromRequest(web);
   web.send(
       200, "text/html",
@@ -666,7 +1035,19 @@ void attachSettingsRoutes() {
   s_wm.server->on("/favicon.ico", HTTP_GET, []() {
     s_wm.server->send(204, "text/plain", "");
   });
+  s_wm.server->on("/portal.css", HTTP_GET, []() {
+    servePortalAsset("text/css; charset=utf-8", kPortalCss, sizeof(kPortalCss) - 1);
+  });
+  s_wm.server->on("/portal.js", HTTP_GET, []() {
+    servePortalAsset("application/javascript; charset=utf-8", kPortalJs,
+                     sizeof(kPortalJs) - 1);
+  });
   s_wm.server->on("/display", HTTP_GET, handleDisplayPage);
+  s_wm.server->on("/display.js", HTTP_GET, []() {
+    servePortalAsset("application/javascript; charset=utf-8", web::display::kScript,
+                     sizeof(web::display::kScript) - 1);
+  });
+  s_wm.server->on("/aircraft.json", HTTP_GET, handleAircraftSnapshot);
   s_wm.server->on("/display.bmp", HTTP_GET, handleDisplayBmp);
   s_wm.server->on("/airports", HTTP_GET, handleAirportSearch);
   s_wm.server->on("/airport", HTTP_GET, handleAirportLookup);
@@ -674,9 +1055,15 @@ void attachSettingsRoutes() {
   s_wm.server->on("/visibility", HTTP_GET, handleVisibility);
   s_wm.server->on("/component", HTTP_GET, handleComponentPage);
   s_wm.server->on("/component-save", HTTP_POST, handleComponentSave);
+  s_wm.server->on("/", HTTP_GET, handleHomePage);
+  s_wm.server->on("/wifi", HTTP_ANY, []() { handleWifiPage(true); });
+  s_wm.server->on("/0wifi", HTTP_GET, []() { handleWifiPage(false); });
+  s_wm.server->on("/info", HTTP_GET, handleInfoPage);
+  // Claim the large common form before WiFiManager's String-based renderer.
+  s_wm.server->on("/param", HTTP_GET, handleCommonSetupPage);
   // Register before WiFiManager's built-in /paramsave handler so the custom
   // confirmation can redirect back to Setup.
-  s_wm.server->on("/paramsave", HTTP_POST, handleSettingsSaved);
+  s_wm.server->on("/paramsave", HTTP_ANY, handleSettingsSaved);
 }
 
 void attachPortalParams(WiFiManager& wm) {
@@ -686,6 +1073,7 @@ void attachPortalParams(WiFiManager& wm) {
   wm.addParameter(&s_param_location_selector);
   wm.addParameter(&s_param_miles);
   wm.addParameter(&s_param_use_iata);
+  wm.addParameter(&s_param_prefer_route);
   wm.addParameter(&s_param_runways);
   wm.addParameter(&s_param_range_break);
   wm.addParameter(&s_param_range);
@@ -814,7 +1202,8 @@ void ensureWifiManager() {
   s_wm.setAPStaticIPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
                            IPAddress(255, 255, 255, 0));
   s_wm.setHostname(config::kPortalHostname);
-  s_wm.setCustomHeadElement(kPortalGlobalStyle);
+  s_wm.setCustomHeadElement(kPortalHead);
+  s_wm.setParamsPage(true); // Custom settings live on the streamed /param page.
   s_wm.setTitle("Plane Radar");
   s_wm.setAPCallback(onConfigPortalApStarted);
   attachPortalParams(s_wm);

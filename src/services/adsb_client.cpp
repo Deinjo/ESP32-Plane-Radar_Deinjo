@@ -8,11 +8,16 @@
 
 #include <cctype>
 #include <cfloat>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
 #include "config.h"
 #include "services/display_settings.h"
+#include "services/flight_data_json.h"
+#include "services/reusable_http_session.h"
+#include "services/tls_slot.h"
+#include "services/tls_record_pool.h"
 
 namespace services::adsb {
 
@@ -23,21 +28,25 @@ constexpr float kKmPerNm = 1.852f;
 constexpr float kMetresPerFoot = 0.3048f;
 constexpr int kConnectAttemptMs = 3000;
 constexpr unsigned long kAdsbRequestTimeoutMs = 5000;
+constexpr unsigned long kAdsbHandshakeTimeoutSec = 5;
 constexpr unsigned long kAdsbFailureBackoffMs = 30000;
 constexpr unsigned long kAdsbMaxFailureBackoffMs = 60000;
 constexpr size_t kEnrichmentCacheSize = 48;
 
 Aircraft s_aircraft[kMaxAircraft];
 size_t s_aircraft_count = 0;
+uint32_t s_aircraft_revision = 0;
+uint32_t s_aircraft_received_ms = 0;
 PollFn s_poll_fn = nullptr;
 unsigned long s_last_enrichment_lookup_ms = 0;
 unsigned long s_last_enrichment_failure_ms = 0;
 unsigned long s_last_adsb_failure_ms = 0;
 uint8_t s_adsb_failure_count = 0;
 bool s_enrichment_paused = false;
-unsigned long s_enrichment_recovery_started_ms = 0;
 double s_last_center_lat = 0.0;
 double s_last_center_lon = 0.0;
+services::net::ReusableHttpSession<WiFiClientSecure, HTTPClient> s_position_session;
+bool enrichmentSlotAllowed();
 
 class ChunkedTransferStream final : public Stream {
  public:
@@ -187,7 +196,7 @@ struct EnrichmentCacheEntry {
   char route[10] = {};
   char type[18] = {};
   unsigned long refreshed_ms = 0;
-  bool has_data = false;
+  bool route_pending = false;
 };
 
 EnrichmentCacheEntry s_enrichment_cache[kEnrichmentCacheSize];
@@ -239,7 +248,6 @@ bool pauseEnrichmentAfterTlsAllocationFailure(WiFiClientSecure& client,
   }
 
   s_enrichment_paused = true;
-  s_enrichment_recovery_started_ms = 0;
   Serial.printf("flight data: paused after %s TLS allocation failure: %s "
                 "heap=%u largest_internal=%u\n",
                 service, error, static_cast<unsigned>(ESP.getFreeHeap()),
@@ -389,8 +397,9 @@ bool cacheEntryFresh(const EnrichmentCacheEntry& entry,
   if (entry.refreshed_ms == 0) {
     return false;
   }
-  const unsigned long ttl = entry.has_data ? config::kFlightCacheSuccessMs
-                                           : config::kFlightCacheMissMs;
+  // Finding an aircraft type does not turn a missing route into a 6 h hit.
+  const unsigned long ttl = entry.route[0] != '\0' ? config::kFlightCacheSuccessMs
+                                                : config::kFlightCacheMissMs;
   return now - entry.refreshed_ms < ttl;
 }
 
@@ -454,37 +463,6 @@ void copySafeIdentifier(const char* source, char* out, size_t out_len) {
     }
   }
   out[written] = '\0';
-}
-
-void copyAirportCode(const JsonObject& airport, char* out, size_t out_len) {
-  if (out_len == 0) {
-    return;
-  }
-  out[0] = '\0';
-  copyJsonStringTrimmed(airport, "iata_code", out, out_len);
-  if (out[0] == '\0') {
-    copyJsonStringTrimmed(airport, "icao_code", out, out_len);
-  }
-}
-
-void parseRoute(const JsonObject& response, char* out, size_t out_len) {
-  if (out_len == 0) {
-    return;
-  }
-  out[0] = '\0';
-  JsonObject route = response["flightroute"].as<JsonObject>();
-  if (route.isNull()) {
-    return;
-  }
-
-  char origin[5] = {};
-  char destination[5] = {};
-  copyAirportCode(route["origin"].as<JsonObject>(), origin, sizeof(origin));
-  copyAirportCode(route["destination"].as<JsonObject>(), destination,
-                  sizeof(destination));
-  if (origin[0] != '\0' && destination[0] != '\0') {
-    snprintf(out, out_len, "%s-%s", origin, destination);
-  }
 }
 
 bool startsWith(const char* value, const char* prefix) {
@@ -594,6 +572,7 @@ bool fetchFlightDataJson(const String& url, const char* callsign,
   const unsigned long started_ms = millis();
   WiFiClientSecure client;
   client.setInsecure();
+  client.setHandshakeTimeout(3);
 
   HTTPClient http;
   if (!http.begin(client, url)) {
@@ -605,6 +584,10 @@ bool fetchFlightDataJson(const String& url, const char* callsign,
   http.useHTTP10(true);
   http.setTimeout(config::kFlightLookupTimeoutMs);
   const int code = performGet(http);
+  Serial.printf("flight data: after-get HTTP=%d heap=%u min_heap=%u largest=%u t=%lums\n",
+                code, static_cast<unsigned>(ESP.getFreeHeap()),
+                static_cast<unsigned>(ESP.getMinFreeHeap()),
+                static_cast<unsigned>(largestInternalFreeBlock()), millis() - started_ms);
 
   DeserializationError error;
   if (code == HTTP_CODE_OK) {
@@ -617,7 +600,9 @@ bool fetchFlightDataJson(const String& url, const char* callsign,
       http.end();
       return false;
     }
-    error = deserializeJson(*doc, *stream);
+    JsonDocument filter;
+    detail::flightDataFilter(filter);
+    error = deserializeJson(*doc, *stream, DeserializationOption::Filter(filter));
   }
   http.end();
 
@@ -646,13 +631,17 @@ bool fetchFlightDataJson(const String& url, const char* callsign,
 }
 
 bool fetchEnrichment(const Aircraft& plane, EnrichmentCacheEntry* entry) {
+  const bool route_only = entry->route_pending;
   entry->route[0] = '\0';
-  entry->type[0] = '\0';
+  if (!route_only) {
+    entry->type[0] = '\0';
+  }
+  const String url = route_only ? callsignRouteUrl(plane) : enrichmentUrl(plane);
 
   {
     JsonDocument doc;
     bool not_found = false;
-    if (!fetchFlightDataJson(enrichmentUrl(plane), plane.callsign, &doc,
+    if (!fetchFlightDataJson(url, plane.callsign, &doc,
                              &not_found)) {
       return false;
     }
@@ -660,32 +649,19 @@ bool fetchEnrichment(const Aircraft& plane, EnrichmentCacheEntry* entry) {
     if (!not_found) {
       JsonObject response = doc["response"].as<JsonObject>();
       if (!response.isNull()) {
-        parseRoute(response, entry->route, sizeof(entry->route));
-        parseDetailedType(response, entry->type, sizeof(entry->type));
-      }
-    }
-  }
-
-  // ADSBDB may return HTTP 200 "unknown aircraft" from the combined endpoint
-  // even though its callsign database has a valid route. Retry only the route
-  // through the callsign endpoint in that case.
-  if (entry->route[0] == '\0') {
-    const String route_url = callsignRouteUrl(plane);
-    if (route_url.length() > 0 && route_url != enrichmentUrl(plane)) {
-      JsonDocument route_doc;
-      bool route_not_found = false;
-      if (!fetchFlightDataJson(route_url, plane.callsign, &route_doc,
-                               &route_not_found)) {
-        return false;
-      }
-      if (!route_not_found) {
-        JsonObject response = route_doc["response"].as<JsonObject>();
-        if (!response.isNull()) {
-          parseRoute(response, entry->route, sizeof(entry->route));
+        detail::parseRoute(response, entry->route, sizeof(entry->route));
+        if (!route_only) {
+          parseDetailedType(response, entry->type, sizeof(entry->type));
         }
       }
     }
   }
+
+  // The combined endpoint can miss a known callsign. Defer its fallback to
+  // another rate-limited slot: never run two TLS handshakes in one loop turn.
+  const String route_url = callsignRouteUrl(plane);
+  entry->route_pending = !route_only && entry->route[0] == '\0' &&
+                        route_url.length() > 0 && route_url != url;
 
   if (entry->route[0] == '\0' && entry->type[0] == '\0') {
     Serial.printf("flight data: no match for %s\n", plane.callsign);
@@ -708,6 +684,10 @@ size_t aircraftCount() { return s_aircraft_count; }
 
 const Aircraft* aircraftList() { return s_aircraft; }
 
+uint32_t aircraftRevision() { return s_aircraft_revision; }
+
+uint32_t aircraftReceivedMs() { return s_aircraft_received_ms; }
+
 bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   const unsigned long now = millis();
   const unsigned long failure_backoff_ms = adsbFailureBackoff();
@@ -726,17 +706,19 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
                   static_cast<unsigned>(s_adsb_failure_count));
     return false;
   };
-  // Reuse one TLS client and HTTP session. Repeatedly creating and destroying
-  // TLS contexts fragments the ESP32-C3 internal heap over long runtimes.
-  static WiFiClientSecure client;
-  static HTTPClient http;
-  if (!client.connected()) {
-    // A peer may have closed keep-alive between polls. Ensure stale TLS state
-    // is released before opening a fresh session on the next request.
-    client.stop();
-  } else {
-    Serial.println("adsb: reusing HTTPS connection");
+  // Keep healthy sessions; replace BOTH objects after peer close or failure.
+  // Reusing stopped TLS internals indefinitely is not a recovery strategy.
+  auto& session = s_position_session;
+  const bool fresh_session = session.prepare();
+  WiFiClientSecure& client = session.client();
+  HTTPClient& http = session.http();
+  if (fresh_session) {
+    client.setInsecure();
+    client.setHandshakeTimeout(kAdsbHandshakeTimeoutSec);
+    static const char* response_headers[] = {"Transfer-Encoding", "Connection"};
+    http.collectHeaders(response_headers, 2U);
   }
+  Serial.println(fresh_session ? "adsb: fresh HTTPS session" : "adsb: reusing HTTPS connection");
 
   const unsigned long started_ms = millis();
   printRequestDiagnostics("request-start", started_ms);
@@ -752,19 +734,10 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   url += "/dist/";
   url += String(dist_nm, 1);
 
-  client.setInsecure();
-
   if (!http.begin(client, url)) {
     Serial.println("adsb: http.begin failed");
-    client.stop();
+    session.discard();
     return requestFailed();
-  }
-
-  static bool response_headers_collected = false;
-  if (!response_headers_collected) {
-    static const char* response_headers[] = {"Transfer-Encoding"};
-    http.collectHeaders(response_headers, 1U);
-    response_headers_collected = true;
   }
 
   http.setReuse(true);
@@ -793,17 +766,21 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
                   static_cast<unsigned>(heap_caps_get_largest_free_block(
                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
     pauseEnrichmentAfterTlsAllocationFailure(client, "ADS-B");
+    char tls_error[96] = {};
+    const int tls_code = client.lastError(tls_error, sizeof(tls_error));
+    Serial.printf("adsb: transport error=%d detail=%s fresh=%d revision=%lu age=%lus\n",
+                  tls_code, tls_error, fresh_session ? 1 : 0,
+                  static_cast<unsigned long>(s_aircraft_revision),
+                  s_aircraft_revision == 0 ? 0UL : (millis() - s_aircraft_received_ms) / 1000UL);
     printNetworkDiagnostics();
-    http.end();
-    client.stop();
+    session.discard();
     return requestFailed();
   }
 
   WiFiClient* stream = http.getStreamPtr();
   if (stream == nullptr) {
     Serial.println("adsb: response stream unavailable");
-    http.end();
-    client.stop();
+    session.discard();
     return requestFailed();
   }
 
@@ -825,6 +802,7 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   aircraft_filter["gs"] = true;
   aircraft_filter["tas"] = true;
   aircraft_filter["ias"] = true;
+  aircraft_filter["seen_pos"] = true;
   DeserializationError err;
   if (chunked_response) {
     ChunkedTransferStream decoded_stream(*stream);
@@ -835,23 +813,24 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
     err = deserializeJson(doc, *stream, DeserializationOption::Filter(filter));
   }
   printRequestDiagnostics("after-json", started_ms);
+  if (http.header("Connection").indexOf("close") >= 0) {
+    Serial.println("adsb: server closes HTTPS session");
+  }
   http.end();
   if (err) {
     Serial.printf("adsb: JSON parse error: %s t=%lums heap=%u min_heap=%u\n",
                   err.c_str(), millis() - started_ms,
                   static_cast<unsigned>(ESP.getFreeHeap()),
                   static_cast<unsigned>(ESP.getMinFreeHeap()));
-    client.stop();
+    session.discard();
     return requestFailed();
-  }
-
-  if (!client.connected()) {
-    client.stop();
   }
 
   JsonArray ac = doc["ac"].as<JsonArray>();
   if (ac.isNull()) {
     s_aircraft_count = 0;
+    s_aircraft_received_ms = millis();
+    ++s_aircraft_revision;
     s_last_adsb_failure_ms = 0;
     s_adsb_failure_count = 0;
     Serial.printf("adsb: valid JSON response has no ac array, size=%d "
@@ -879,12 +858,23 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
     s_aircraft[n].nose_deg = pickNoseHeading(plane);
     s_aircraft[n].track_deg = pickTrackHeading(plane);
     s_aircraft[n].gs_knots = pickGroundSpeed(plane);
+    const float age_s = plane["seen_pos"] | 0.0f;
+    s_aircraft[n].position_age_s =
+        std::isfinite(age_s) && age_s >= 0.0f ? age_s : 10.0f;
+    const float ground_speed = plane["gs"] | -1.0f;
+    const float ground_track = plane["track"] | -1.0f;
+    s_aircraft[n].motion_valid =
+        std::isfinite(ground_speed) && ground_speed >= 0.0f &&
+        ground_speed <= 1500.0f && std::isfinite(ground_track) &&
+        ground_track >= 0.0f && ground_track < 360.0f;
     fillTagFields(&s_aircraft[n], plane);
     applyCachedEnrichment(&s_aircraft[n]);
     ++n;
   }
 
   s_aircraft_count = n;
+  s_aircraft_received_ms = millis();
+  ++s_aircraft_revision;
   s_last_adsb_failure_ms = 0;
   s_adsb_failure_count = 0;
   printRequestDiagnostics("request-ok", started_ms);
@@ -915,7 +905,9 @@ bool enrichOnePending() {
     EnrichmentCacheEntry* cached = findCacheEntry(plane, now);
     if (cached != nullptr) {
       applyCacheEntry(&plane, *cached);
-      continue;
+      if (!cached->route_pending) {
+        continue;
+      }
     }
 
     const float dlat = plane.lat - static_cast<float>(s_last_center_lat);
@@ -933,10 +925,39 @@ bool enrichOnePending() {
 
   Aircraft& plane = s_aircraft[candidate_index];
   s_last_enrichment_lookup_ms = now;
+  // Optional lookups must not compete with a stale/failing position feed.
+  if (s_adsb_failure_count != 0 || now - s_aircraft_received_ms > 6000UL) {
+    return false;
+  }
+  s_position_session.discard();
+  Serial.printf("flight data: TLS slot heap=%u largest=%u\n",
+                static_cast<unsigned>(ESP.getFreeHeap()),
+                static_cast<unsigned>(largestInternalFreeBlock()));
+  if (!services::net::tlsRecordPoolIdle() || !enrichmentSlotAllowed()) {
+    return false;
+  }
+#ifdef PLANE_RADAR_ROUTE_MEMORY_PROBE
+  // Test-build only: exercise a known public route without altering the feed.
+  static bool probe_done = false;
+  if (!probe_done && now >= 30000UL) {
+    probe_done = true;
+    Aircraft probe = {};
+    strncpy(probe.callsign, "DLH400", sizeof(probe.callsign) - 1);
+    EnrichmentCacheEntry result = {};
+    const bool ok = fetchEnrichment(probe, &result);
+    Serial.printf("flight data: diagnostic probe ok=%d route=%s heap=%u min_heap=%u\n",
+                  ok ? 1 : 0, result.route,
+                  static_cast<unsigned>(ESP.getFreeHeap()),
+                  static_cast<unsigned>(ESP.getMinFreeHeap()));
+    return false;
+  }
+#endif
   EnrichmentCacheEntry* entry = cacheSlotFor(plane, now);
-  *entry = {};
-  strncpy(entry->hex, plane.hex, sizeof(entry->hex) - 1);
-  strncpy(entry->callsign, plane.callsign, sizeof(entry->callsign) - 1);
+  if (!sameKey(*entry, plane) || !entry->route_pending) {
+    *entry = {};
+    strncpy(entry->hex, plane.hex, sizeof(entry->hex) - 1);
+    strncpy(entry->callsign, plane.callsign, sizeof(entry->callsign) - 1);
+  }
 
   if (!fetchEnrichment(plane, entry)) {
     // Network failures are retried after a short global backoff.
@@ -947,7 +968,6 @@ bool enrichOnePending() {
 
   s_last_enrichment_failure_ms = 0;
   entry->refreshed_ms = millis();
-  entry->has_data = entry->route[0] != '\0' || entry->type[0] != '\0';
   const bool changed = applyCacheEntry(&plane, *entry);
   Serial.printf("flight data: %s %s %s\n", plane.callsign,
                 entry->route[0] != '\0' ? entry->route : "(route unknown)",
@@ -955,14 +975,15 @@ bool enrichOnePending() {
   return changed;
 }
 
-bool enrichmentAllowed() {
+namespace {
+
+bool enrichmentSlotAllowed() {
   const uint32_t free_heap = ESP.getFreeHeap();
   const size_t largest_block = largestFreeBlock();
   const size_t largest_internal_block = largestInternalFreeBlock();
-  const bool pause_critical =
-      free_heap < config::kEnrichmentPauseFreeHeap ||
-      largest_block < config::kEnrichmentPauseLargestBlock ||
-      largest_internal_block < config::kEnrichmentPauseLargestBlock;
+  const bool pause_critical = !services::net::tlsSlotHasReserve(
+      free_heap, largest_block, largest_internal_block,
+      config::kEnrichmentSlotFreeHeap, config::kEnrichmentSlotLargestBlock);
 
   if (pause_critical) {
     if (!s_enrichment_paused) {
@@ -971,7 +992,6 @@ bool enrichmentAllowed() {
                     static_cast<unsigned>(largest_block));
     }
     s_enrichment_paused = true;
-    s_enrichment_recovery_started_ms = 0;
     return false;
   }
 
@@ -979,31 +999,13 @@ bool enrichmentAllowed() {
     return true;
   }
 
-  const bool recovered =
-      free_heap >= config::kEnrichmentResumeFreeHeap &&
-      largest_block >= config::kEnrichmentResumeLargestBlock &&
-      largest_internal_block >= config::kEnrichmentResumeLargestBlock;
-  if (!recovered) {
-    s_enrichment_recovery_started_ms = 0;
-    return false;
-  }
-
-  const unsigned long now = millis();
-  if (s_enrichment_recovery_started_ms == 0) {
-    s_enrichment_recovery_started_ms = now;
-    return false;
-  }
-  if (now - s_enrichment_recovery_started_ms <
-      config::kEnrichmentResumeStableMs) {
-    return false;
-  }
-
   s_enrichment_paused = false;
-  s_enrichment_recovery_started_ms = 0;
   Serial.printf("flight data: resumed, heap=%u largest=%u\n",
                 static_cast<unsigned>(free_heap),
                 static_cast<unsigned>(largest_block));
   return true;
 }
+
+}  // namespace
 
 }  // namespace services::adsb

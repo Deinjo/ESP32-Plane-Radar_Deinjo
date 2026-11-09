@@ -2,6 +2,7 @@
 
 #include <lgfx/v1/lgfx_fonts.hpp>
 
+#include <bitset>
 #include <cmath>
 #include <cstdlib>
 
@@ -28,8 +29,9 @@ constexpr float kKmPerDeg = 111.0f;
 constexpr float kDegToRad = 0.01745329252f;
 constexpr size_t kMaxAirportLabels = 32;
 
-bool s_in_range[data::large_airports::kAirportCount];
-bool s_label_pending[data::large_airports::kAirportCount];
+// Two flags per airport, not two bytes: leave scarce DRAM for Wi-Fi/TLS.
+std::bitset<data::large_airports::kAirportCount> s_in_range;
+std::bitset<data::large_airports::kAirportCount> s_label_pending;
 
 bool s_runway_label_ready = false;
 bool s_runway_label_use_vlw = false;
@@ -276,23 +278,33 @@ void drawLargeAirportRunways(lgfx::LGFXBase& gfx) {
   uint16_t label_airports[kMaxAirportLabels];
   size_t label_count = 0;
 
-  for (size_t i = 0; i < data::large_airports::kAirportCount; ++i) {
-    s_in_range[i] = false;
-    s_label_pending[i] = false;
+  static bool range_cache_valid = false;
+  static double range_lat = 0.0;
+  static double range_lon = 0.0;
+  static float range_radius_km = 0.0f;
+  const bool refresh_range = !range_cache_valid ||
+      range_lat != services::location::lat() ||
+      range_lon != services::location::lon() || range_radius_km != radius_km;
+  s_label_pending.reset();
+  if (refresh_range) {
+    for (size_t i = 0; i < data::large_airports::kAirportCount; ++i) {
+      const auto& ap = data::large_airports::kAirports[i];
+      float dx_km = 0.0f;
+      float dy_km = 0.0f;
+      float dist_km = 0.0f;
+      offsetKmFromCenter(e7ToDeg(ap.lat_e7), e7ToDeg(ap.lon_e7), &dx_km,
+                         &dy_km, &dist_km);
+      s_in_range[i] = dist_km <= radius_km;
+    }
+    range_lat = services::location::lat();
+    range_lon = services::location::lon();
+    range_radius_km = radius_km;
+    range_cache_valid = true;
   }
 
   for (size_t i = 0; i < data::large_airports::kRunwayCount; ++i) {
     const auto& rw = data::large_airports::kRunways[i];
     const uint16_t ap_idx = rw.airport_idx;
-    if (!s_in_range[ap_idx]) {
-      const auto& ap = data::large_airports::kAirports[ap_idx];
-      float dx_km = 0.0f;
-      float dy_km = 0.0f;
-      float dist_km = 0.0f;
-      offsetKmFromCenter(e7ToDeg(ap.lat_e7), e7ToDeg(ap.lon_e7), &dx_km, &dy_km,
-                         &dist_km);
-      s_in_range[ap_idx] = (dist_km <= radius_km);
-    }
     if (!s_in_range[ap_idx]) {
       continue;
     }
