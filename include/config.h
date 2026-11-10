@@ -42,6 +42,8 @@ constexpr char kWifiFallbackPass[] = PLANE_RADAR_WIFI_FALLBACK_PASS;
 constexpr unsigned long kWifiConnectAttemptMs = 15000;
 constexpr uint8_t kWifiConnectAttempts = 3;
 constexpr unsigned long kWifiPortalTimeoutSec = 0;  // 0 = no timeout while configuring
+/** With known credentials, retry them after the setup AP had no client this long. */
+constexpr unsigned long kWifiPortalRetryKnownMs = 5UL * 60UL * 1000UL;
 constexpr unsigned long kWifiConnectingFrameMs = 50;
 /** Wait after disconnect before reconnecting (avoids portal on brief drops). */
 constexpr unsigned long kWifiDownGraceMs = 4000;

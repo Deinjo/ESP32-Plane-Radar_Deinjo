@@ -4,6 +4,10 @@ Requires Playwright. --check-rejections sends only incomplete POSTs after the
 new form markers have been verified. No valid Save, restart or reset is used.
 Values stay in memory; screenshots mask coordinates/passwords and the report
 contains no setting values. Browser closes even on failure.
+
+LAN setup pages require the OTA credentials. Supply the password through the
+PLANE_RADAR_OTA_PASSWORD environment variable; it is never written to output.
+Unauthenticated checks confirm 401 for settings routes and 200 for display routes.
 """
 
 import argparse
@@ -49,9 +53,13 @@ def main():
     parser.add_argument("--passes", type=int, default=3)
     parser.add_argument("--check-rejections", action="store_true")
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--user", default="admin", help="Portal/OTA user name")
     args = parser.parse_args()
     if not 1 <= args.passes <= 5:
         parser.error("Use 1..5 passes")
+    password = os.environ.get("PLANE_RADAR_OTA_PASSWORD")
+    if not password:
+        parser.error("Set PLANE_RADAR_OTA_PASSWORD for the authenticated setup pages")
     base = args.url.rstrip("/")
     temp = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()))
     temp = temp / "Temp" / "opencode" if os.name == "nt" else temp
@@ -63,7 +71,27 @@ def main():
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True, channel=args.channel)
         try:
-            page = browser.new_page(viewport={"width": 950, "height": 900})
+            report["stage"] = "unauthenticated access"
+            anonymous = playwright.request.new_context()
+            try:
+                # Order matters: /param is probed first, so firmware without the
+                # guard fails here before /erase, /restart or /wifisave is reached.
+                for path in ("/param", "/component", "/wifi", "/info", "/erase",
+                             "/restart", "/wifisave", "/firmware"):
+                    response = anonymous.get(base + path, timeout=20000, max_redirects=0)
+                    assert response.status == 401, f"{path} must require authentication"
+                for path in ("/paramsave", "/component-save", "/location-default"):
+                    response = anonymous.post(base + path, form={}, timeout=20000)
+                    assert response.status == 401, f"{path} must require authentication"
+                for path in ("/display", "/aircraft.json", "/airports?q=ED"):
+                    response = anonymous.get(base + path, timeout=20000)
+                    assert response.status == 200, f"{path} must stay public"
+            finally:
+                anonymous.dispose()
+            report["settings_require_authentication"] = True
+            page = browser.new_page(viewport={"width": 950, "height": 900},
+                                    http_credentials={"username": args.user,
+                                                      "password": password})
             # Never persist runtime error text that could contain field values.
             page.on("pageerror", lambda error: errors.append(type(error).__name__))
             report["stage"] = "shared assets"
@@ -161,9 +189,7 @@ def main():
                     page.goto(base + path, wait_until="networkidle", timeout=30000)
                     assert state(page) == initial[path], f"Rejected request changed settings: {path}"
 
-            report["stage"] = "OTA authentication"
-            response = page.request.get(base + "/firmware", timeout=20000)
-            assert response.status == 401, "Firmware page must require authentication"
+            # Unauthenticated /firmware returned 401 in the anonymous stage above.
             report["ota_requires_authentication"] = True
             report["stage"] = "mobile layout"
             page.set_viewport_size({"width": 390, "height": 844})

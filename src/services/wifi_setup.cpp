@@ -12,6 +12,7 @@
 
 #include <Preferences.h>
 #include <esp_system.h>
+#include <esp_task_wdt.h>
 #include <esp_wifi.h>
 #include <lwip/sockets.h>
 
@@ -160,6 +161,12 @@ class PortalWiFiManager : public WiFiManager {
     return fields;
   }
   void notePortalRequest() { handleRequest(); }
+  // Native settings-changing handlers, reached only through authorized routes.
+  void nativeWifiSave() { handleWifiSave(); }
+  void nativeRestart() { handleReset(); }
+  void nativeExit() { handleExit(); }
+  void nativeClose() { handleClose(); }
+  void nativeErase() { handleErase(false); }
 };
 PortalWiFiManager s_wm;
 bool s_wm_configured = false;
@@ -230,8 +237,12 @@ void handleAirportLookup() {
   s_wm.server->send(200, "application/json", body);
 }
 
+bool settingsRequestAuthorized() {
+  return services::ota::authorizeSettingsRequest();
+}
+
 void handleLocationDefault() {
-  if (!s_wm.server) return;
+  if (!s_wm.server || !settingsRequestAuthorized()) return;
   services::location::clear();
   s_wm.server->send(200, "application/json",
                     "{\"success\":true,\"lat\":" +
@@ -451,7 +462,7 @@ void handleHomePage() {
 }
 
 void handleWifiPage(bool scan) {
-  if (!s_wm.server) {
+  if (!s_wm.server || !settingsRequestAuthorized()) {
     return;
   }
   WebServer& web = *s_wm.server;
@@ -489,7 +500,7 @@ void rejectIncompleteForm(WebServer& web) {
 }
 
 void handleInfoPage() {
-  if (!s_wm.server) {
+  if (!s_wm.server || !settingsRequestAuthorized()) {
     return;
   }
   WebServer& web = *s_wm.server;
@@ -562,7 +573,7 @@ void appendComponentRow(PortalHtml& page, const char* id, const char* label,
 }
 
 void handleComponentPage() {
-  if (!s_wm.server) return;
+  if (!s_wm.server || !settingsRequestAuthorized()) return;
   WebServer& web = *s_wm.server;
   startPortalPage(web);
   PortalChunkSink sink{web};
@@ -618,7 +629,7 @@ void handleComponentPage() {
 }
 
 void handleComponentSave() {
-  if (!s_wm.server) return;
+  if (!s_wm.server || !settingsRequestAuthorized()) return;
   WebServer& web = *s_wm.server;
   const String marker = web.arg(services::portal::kFormCompleteField);
   if (!services::portal::completeComponentForm(marker.c_str(), [&web](const char* name) {
@@ -895,7 +906,7 @@ void appendPortalParameter(PortalHtml& page, const WiFiManagerParameter& paramet
 }
 
 void handleCommonSetupPage() {
-  if (!s_wm.server) {
+  if (!s_wm.server || !settingsRequestAuthorized()) {
     return;
   }
   WebServer& web = *s_wm.server;
@@ -986,7 +997,7 @@ void savePortalParamsFromRequest(WebServer& web) {
 }
 
 void handleSettingsSaved() {
-  if (!s_wm.server) {
+  if (!s_wm.server || !settingsRequestAuthorized()) {
     return;
   }
 
@@ -1057,13 +1068,32 @@ void attachSettingsRoutes() {
   s_wm.server->on("/component-save", HTTP_POST, handleComponentSave);
   s_wm.server->on("/", HTTP_GET, handleHomePage);
   s_wm.server->on("/wifi", HTTP_ANY, []() { handleWifiPage(true); });
-  s_wm.server->on("/0wifi", HTTP_GET, []() { handleWifiPage(false); });
-  s_wm.server->on("/info", HTTP_GET, handleInfoPage);
+  // HTTP_ANY: any other method would otherwise reach WiFiManager's native,
+  // unauthenticated renderer for the same path.
+  s_wm.server->on("/0wifi", HTTP_ANY, []() { handleWifiPage(false); });
+  s_wm.server->on("/info", HTTP_ANY, handleInfoPage);
   // Claim the large common form before WiFiManager's String-based renderer.
-  s_wm.server->on("/param", HTTP_GET, handleCommonSetupPage);
+  s_wm.server->on("/param", HTTP_ANY, handleCommonSetupPage);
   // Register before WiFiManager's built-in /paramsave handler so the custom
   // confirmation can redirect back to Setup.
   s_wm.server->on("/paramsave", HTTP_ANY, handleSettingsSaved);
+  // Claim WiFiManager's settings-changing routes before the library registers
+  // them; credential save/connect, restart and erase stay native once allowed.
+  s_wm.server->on("/wifisave", HTTP_ANY, []() {
+    if (settingsRequestAuthorized()) s_wm.nativeWifiSave();
+  });
+  s_wm.server->on("/restart", HTTP_ANY, []() {
+    if (settingsRequestAuthorized()) s_wm.nativeRestart();
+  });
+  s_wm.server->on("/exit", HTTP_ANY, []() {
+    if (settingsRequestAuthorized()) s_wm.nativeExit();
+  });
+  s_wm.server->on("/close", HTTP_ANY, []() {
+    if (settingsRequestAuthorized()) s_wm.nativeClose();
+  });
+  s_wm.server->on("/erase", HTTP_ANY, []() {
+    if (settingsRequestAuthorized()) s_wm.nativeErase();
+  });
 }
 
 void attachPortalParams(WiFiManager& wm) {
@@ -1257,11 +1287,14 @@ void startStaConnect(const String& ssid, const String& pass) {
 }
 
 bool waitForLinkWithUi(const char* ssid_for_ui, unsigned long attempt_ms) {
-  const unsigned long deadline = millis() + attempt_ms;
-  while (millis() < deadline) {
+  const unsigned long started = millis();
+  while (millis() - started < attempt_ms) {
     if (wifiLinkUp()) {
       return true;
     }
+    // Runtime reconnects run inside loop(); a 15 s attempt must not trip the
+    // task watchdog. Harmless during boot, before loop() subscribes to it.
+    esp_task_wdt_reset();
     bootButtonPollLongPress();
     statusScreenConnectingTick();
     delay(config::kWifiConnectingFrameMs);
@@ -1286,6 +1319,7 @@ bool tryConnectWithUi(const String& ssid, const String& pass, bool show_ui) {
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
       delay(400);
+      esp_task_wdt_reset();
     }
 
     startStaConnect(ssid, pass);
@@ -1325,21 +1359,50 @@ bool connectSavedNetwork(bool show_ui) {
 }
 
 bool openConfigPortal() {
-  stopLanWebPortal();
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  delay(50);
-  statusScreenPortal();
-  s_wm.setConfigPortalBlocking(false);
-  s_wm.startConfigPortal(config::kPortalApName);
-  while (s_wm.getConfigPortalActive()) {
-    bootButtonPollLongPress();
-    if (s_wm.process()) {
+  // Decide before the portal disconnects: after a BOOT reset the credentials
+  // are erased and the portal must stay open until the user configures it.
+  const bool can_retry_known_network =
+      storedWifiCredentials() || config::kWifiFallbackSSID[0] != '\0';
+
+  while (true) {
+    stopLanWebPortal();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    delay(50);
+    statusScreenPortal();
+    s_wm.setConfigPortalBlocking(false);
+    s_wm.startConfigPortal(config::kPortalApName);
+
+    // WiFiManager ignores its own portal timeout in non-blocking mode.
+    unsigned long idle_since = millis();
+    while (s_wm.getConfigPortalActive()) {
+      esp_task_wdt_reset();
+      bootButtonPollLongPress();
+      if (s_wm.process()) {
+        return true;
+      }
+      if (WiFi.softAPgetStationNum() > 0) {
+        idle_since = millis();
+      } else if (can_retry_known_network &&
+                 millis() - idle_since >= config::kWifiPortalRetryKnownMs) {
+        break;
+      }
+      delay(10);
+    }
+
+    if (!s_wm.getConfigPortalActive()) {
+      return wifiLinkUp();
+    }
+
+    // Nobody is using the portal, e.g. after a router outage at boot: try the
+    // known network again instead of staying in setup mode indefinitely.
+    Serial.println("Setup portal idle — retrying saved WiFi");
+    s_wm.stopConfigPortal();
+    if (connectSavedNetwork(true) || connectFallbackNetwork(true)) {
       return true;
     }
-    delay(10);
+    Serial.println("Saved WiFi still unavailable — reopening setup portal");
   }
-  return wifiLinkUp();
 }
 
 }  // namespace
