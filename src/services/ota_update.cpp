@@ -2,6 +2,7 @@
 
 #include <Update.h>
 #include <WiFiManager.h>
+#include <esp_task_wdt.h>
 
 #include "config.h"
 #include "services/display_settings.h"
@@ -36,11 +37,25 @@ or PlatformIO's <strong>firmware.bin</strong>.</p>
 </div></main></body></html>
 )HTML";
 
+/** Release the radar if an upload stops without reaching the done handler. */
+constexpr unsigned long kUploadIdleTimeoutMs = 30000UL;
+
 WiFiManager* s_manager = nullptr;
 AdditionalRoutesFn s_additional_routes = nullptr;
 bool s_in_progress = false;
 bool s_upload_authenticated = false;
+unsigned long s_last_upload_activity_ms = 0;
 String s_upload_error;
+
+void abortUpload(const char* reason) {
+  if (Update.isRunning()) {
+    Update.abort();
+  }
+  if (s_in_progress) {
+    Serial.printf("OTA aborted: %s\n", reason);
+  }
+  s_in_progress = false;
+}
 
 WebServer* server() {
   if (s_manager == nullptr || !s_manager->server) {
@@ -83,6 +98,20 @@ void handleUploadChunk() {
     return;
   }
   HTTPUpload& upload = web->upload();
+  // The whole multipart upload is parsed inside one handleClient() call, so
+  // loop() cannot feed the runtime watchdog while a large image is written.
+  esp_task_wdt_reset();
+  s_last_upload_activity_ms = millis();
+
+  // WebServer does not call the done handler after an aborted upload. Handle
+  // it before the auth/error guard so the radar loop is always released.
+  if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (s_upload_authenticated && s_upload_error.length() == 0) {
+      s_upload_error = "Upload aborted";
+    }
+    abortUpload("client disconnected");
+    return;
+  }
 
   if (upload.status == UPLOAD_FILE_START) {
     s_upload_authenticated =
@@ -119,9 +148,6 @@ void handleUploadChunk() {
     } else {
       Serial.printf("OTA: wrote %u bytes\n", upload.totalSize);
     }
-  } else if (upload.status == UPLOAD_FILE_ABORTED) {
-    s_upload_error = "Upload aborted";
-    Update.end();
   }
 }
 
@@ -192,6 +218,21 @@ void configure(WiFiManager& manager, AdditionalRoutesFn additional_routes) {
   manager.setWebServerCallback(attachRoutes);
 }
 
-bool inProgress() { return s_in_progress; }
+bool authorizeSettingsRequest() {
+  // The setup access point is the first-run/reset path with physical access;
+  // only the home-network portal requires credentials for settings.
+  if (s_manager != nullptr && s_manager->getConfigPortalActive()) {
+    return true;
+  }
+  return requestAuthenticated();
+}
+
+bool inProgress() {
+  if (s_in_progress &&
+      millis() - s_last_upload_activity_ms >= kUploadIdleTimeoutMs) {
+    abortUpload("no upload data for 30 s");
+  }
+  return s_in_progress;
+}
 
 }  // namespace services::ota

@@ -83,6 +83,19 @@ Some clients resolve `.local` addresses slowly. The IP address shown in the seri
 
 The LAN portal and the setup access point expose the same configuration interface.
 
+On the home network, every page that changes or reveals device settings
+(Wi-Fi, Common/Component Setup, location reset, device information, restart,
+exit, erase and firmware update) requires the user `admin` and the OTA
+password. The default password is `plane-radar`; change it in `Common Setup`
+after the first login. The home page, `Display`, the live image/table and the
+airport search remain public. While the device runs its own `PlaneRadar-Setup`
+access point, the settings pages need no password so first-time setup stays
+simple; the firmware update always requires it.
+
+If the setup access point opened only because the saved Wi-Fi was unreachable
+(for example, a router outage during boot), the device retries the saved
+network after five minutes without a connected setup client.
+
 ### Main Page
 
 The main page provides links for:
@@ -145,8 +158,9 @@ Both setup forms reject incomplete submissions with HTTP 400 before writing
 settings. Reload the page if that happens; a cached form from older firmware
 also needs to be reloaded. Unchecked checkboxes are valid and are not required
 in the request. The OTA password field stays blank: leave it blank to retain
-the stored password. These completeness checks are not authentication or CSRF
-protection; keep the configuration portal on a trusted network.
+the stored password. These completeness checks are separate from the password
+protection above and are not CSRF protection; keep the configuration portal
+on a trusted network.
 
 ### Component Setup
 

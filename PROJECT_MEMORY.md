@@ -54,6 +54,26 @@ pio run -e supermini -t upload --upload-port COM10
 - Ring octant pixels are cached in a bounded 1.5 KB array; the current four two-pixel rings need 379 of 512 entries. Airport range flags are bit-packed and recomputed only after location/query-radius changes. Neither optimization uses a second full-screen framebuffer.
 - Ground aircraft are intentionally hidden by default (`kAdsbShowGroundAircraft = false`). A valid empty visible-aircraft result is not by itself evidence of a parser failure.
 
+## Portal authentication, Wi-Fi recovery and OTA abort (2026-11-10)
+
+- User decision: on the home network every settings-changing/revealing route
+  requires `admin` + OTA password via `services::ota::authorizeSettingsRequest()`
+  (`/param`, `/paramsave`, `/component*`, `/location-default`, `/wifi`, `/0wifi`,
+  `/info`, and wrapped native `/wifisave`, `/restart`, `/exit`, `/close`, `/erase`).
+  Display/table/BMP, home page, airport search and assets stay public. While the
+  setup AP is active the settings routes are open; `/firmware` always needs auth.
+- Runtime reconnect feeds the task watchdog inside `waitForLinkWithUi()`; the
+  wait is rollover-safe. `openConfigPortal()` retries known credentials after
+  `kWifiPortalRetryKnownMs` (5 min) without an AP client; after BOOT reset there
+  are none, so the portal stays open as before.
+- OTA: aborted uploads (no done handler from WebServer) release `inProgress()`;
+  30 s without upload data also releases it. Upload chunks feed the watchdog.
+- Flashed without NVS erase (device enumerated as COM9 on this host). Verified
+  on the device: unauthenticated settings routes return 401, public routes 200,
+  authenticated `/param` 200; 40 s serial sample without errors/resets. NOT yet
+  tested on the device: OTA abort recovery, router outage/reconnect, portal
+  retry. `scripts/check_setup_pages.py` now needs `PLANE_RADAR_OTA_PASSWORD`.
+
 ## Setup portal reliability
 
 - Missing Common Setup fields were reproduced in HTTP 200 responses: the page
